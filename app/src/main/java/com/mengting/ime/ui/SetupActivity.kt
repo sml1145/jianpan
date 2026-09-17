@@ -38,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -177,29 +178,33 @@ class SetupActivity : ComponentActivity() {
         val localVer = remember { UpdateChecker.localVersion(ctx) }
 
         fun startDownload(remote: UpdateChecker.Remote) {
-            scope.launch {
-                showUpdateDialog = false
-                pendingUpdate = null
-                downloading = true
-                progress = 0
-                updateMsg = "正在下载 ${remote.tag}…"
-                if (!UpdateChecker.canInstallUnknown(ctx)) {
-                    downloading = false
-                    updateMsg = "需要「安装未知应用」权限，授权后请重新检测更新"
-                    UpdateChecker.openUnknownSourcesSettings(ctx)
-                    return@launch
-                }
-                val f = UpdateChecker.download(ctx, remote.apkUrl ?: "", remote.sha256) { p -> progress = p }
+            showUpdateDialog = false
+            pendingUpdate = null
+            downloading = true
+            progress = 0
+            updateMsg = "正在下载 ${remote.tag}（多通道自动切换）…"
+            if (!UpdateChecker.canInstallUnknown(ctx)) {
                 downloading = false
-                if (f != null) {
-                    progress = -1
-                    updateMsg = "下载完成并通过校验，正在拉起安装 ${remote.tag}"
-                    UpdateChecker.install(ctx, f)
-                } else {
-                    val reason = UpdateChecker.lastDownloadError ?: "未知错误"
-                    updateMsg = "下载失败：$reason（可重试，已支持断点续传）"
-                }
+                updateMsg = "需要「安装未知应用」权限，授权后请重新检测更新"
+                UpdateChecker.openUnknownSourcesSettings(ctx)
+                return
             }
+            UpdateChecker.startDownload(
+                ctx, remote,
+                onProgress = { p -> progress = p },
+                onDone = { f ->
+                    downloading = false
+                    if (f != null) {
+                        progress = -1
+                        updateMsg = "下载完成并通过校验，正在拉起安装 ${remote.tag}"
+                        UpdateChecker.install(ctx, f)
+                    } else {
+                        progress = -1
+                        val reason = UpdateChecker.lastDownloadError ?: "未知错误"
+                        updateMsg = "下载失败：$reason\n可稍后重试（支持断点续传，自动切换加速通道）"
+                    }
+                }
+            )
         }
 
         Box(Modifier.fillMaxSize().background(Color(0xFFFFF7FB))) {
@@ -318,6 +323,27 @@ class SetupActivity : ComponentActivity() {
                         }
                         SwitchRow("按键振动", vib) { vib = it; AppPrefs.vibrateOn = it }
                         SwitchRow("联网增强词库（提升词汇准确率，默认开）", net) { net = it; AppPrefs.netBoost = it }
+
+                        Spacer(Modifier.height(10.dp))
+                        Section("语音模型（安装后从镜像源下载）")
+                        val mStatus by com.mengting.ime.feature.voice.ModelStore.status.collectAsState()
+                        Text(
+                            when (val s = mStatus) {
+                                is com.mengting.ime.feature.voice.ModelStore.Status.Ready -> "语音模型已就绪，长按空格即可语音输入"
+                                is com.mengting.ime.feature.voice.ModelStore.Status.Downloading -> "语音模型下载中 ${s.percent}%（后台进行，可退出页面）"
+                                is com.mengting.ime.feature.voice.ModelStore.Status.Failed -> s.msg
+                                else -> "语音模型尚未下载（约 230MB，国内镜像直连）"
+                            },
+                            fontSize = 12.sp, color = Color(0xFF6B5670)
+                        )
+                        if (mStatus !is com.mengting.ime.feature.voice.ModelStore.Status.Ready &&
+                            mStatus !is com.mengting.ime.feature.voice.ModelStore.Status.Downloading
+                        ) {
+                            Button(
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                                onClick = { com.mengting.ime.feature.voice.ModelStore.download(ctx) }
+                            ) { Text("下载语音模型") }
+                        }
                     }
                     else -> {
                         // ===== 主页 =====

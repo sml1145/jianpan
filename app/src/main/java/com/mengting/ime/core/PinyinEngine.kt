@@ -60,8 +60,19 @@ object PinyinEngine {
                 // 加载失败不置 ready，下次调用会重试；记录日志便于诊断
                 android.util.Log.e("MTDict", "loadChars failed", e)
             }
+            // 首批高频词同步加载（约 0.7MB，百毫秒级），保证键盘弹出即有词候选
+            if (ready && !wordsReady) {
+                try {
+                    val loaded = loadWordsSync(ctx, STAGE1_WORDS)
+                    if (loaded > 0) {
+                        android.util.Log.i("MTDict", "stage1 sync loaded $loaded words")
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.e("MTDict", "stage1 sync failed", e)
+                }
+            }
         }
-        if (ready && !wordsLoading) {
+        if (ready && wordsReady && !wordsLoading) {
             wordsLoading = true
             Thread({
                 try { loadWordsStaged(ctx) } finally { wordsLoading = false }
@@ -70,6 +81,31 @@ object PinyinEngine {
     }
 
     @Volatile private var wordsLoading = false
+
+    /** 同步读取前 limit 条词并发布；返回已加载条数 */
+    private fun loadWordsSync(ctx: Context, limit: Int): Int {
+        val words = ArrayList<String>(limit)
+        val freqs = ArrayList<Int>(limit)
+        val byPy = HashMap<String, ArrayList<Int>>(limit)
+        var count = 0
+        ctx.assets.open("dict/word_freq_py.txt").bufferedReader().useLines { lines ->
+            for (ln in lines) {
+                if (count >= limit) break
+                val p = ln.split('\t')
+                if (p.size < 3) continue
+                val idx = words.size
+                words.add(p[1])
+                freqs.add(p[2].toIntOrNull() ?: 0)
+                byPy.getOrPut(p[0]) { ArrayList() }.add(idx)
+                count++
+            }
+        }
+        if (count > 0) {
+            publish(words, freqs, byPy)
+            wordsReady = true
+        }
+        return count
+    }
 
     private fun loadChars(ctx: Context) {
         ctx.assets.open("dict/char_pinyin.txt").bufferedReader().useLines { lines ->

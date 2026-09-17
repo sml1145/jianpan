@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -195,7 +196,7 @@ object UpdateChecker {
         CheckResult(null, errors)
     }
 
-    // ---------------- 下载（断点续传 + 校验 + 失败重试） ----------------
+    // ---------------- 下载（多通道回退 + 断点续传 + 校验 + 空间预检） ----------------
 
     class UpdateException(msg: String) : Exception(msg)
 
@@ -203,23 +204,68 @@ object UpdateChecker {
     @Volatile var lastDownloadError: String? = null
         private set
 
+    /** 独立单例作用域：下载不因设置页退出/切后台被取消 */
+    private val downloadScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+    )
+
+    @Volatile private var downloadJob: kotlinx.coroutines.Job? = null
+
+    /** 启动下载（幂等：已在下载则忽略）；onState 回调进度/结果 */
+    fun startDownload(
+        ctx: Context, remote: Remote,
+        onProgress: (Int) -> Unit,
+        onDone: (File?) -> Unit
+    ) {
+        downloadJob?.takeIf { it.isActive }?.let { return }
+        downloadJob = downloadScope.launch {
+            val f = download(ctx, remote, onProgress)
+            withContext(Dispatchers.Main) { onDone(f) }
+        }
+    }
+
+    /** 下载通道：直连 + 国内加速镜像，按序回退 */
+    private fun candidateUrls(url: String): List<String> = listOf(
+        url,
+        "https://gh-proxy.com/$url",
+        "https://mirror.ghproxy.com/$url",
+        "https://ghproxy.net/$url"
+    )
+
     suspend fun download(
-        ctx: Context, url: String, sha256: String?,
+        ctx: Context, remote: Remote,
         onProgress: (Int) -> Unit
     ): File? = withContext(Dispatchers.IO) {
         lastDownloadError = null
-        var attempt = 0
-        while (attempt < 2) {
-            attempt++
-            try {
-                val f = downloadOnce(ctx, url, sha256, onProgress)
-                if (f != null) return@withContext f
-            } catch (e: Exception) {
-                lastDownloadError = e.message ?: e.javaClass.simpleName
-                android.util.Log.e("MTUpdate", "download attempt $attempt failed", e)
-            }
-            if (attempt < 2) delay(1200)
+        val url = remote.apkUrl
+        if (url.isNullOrBlank()) {
+            lastDownloadError = "发布页没有安装包附件"
+            return@withContext null
         }
+        // 空间预检：需要约 2 倍安装包大小（part + 成品）
+        val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
+        val free = try { android.os.StatFs(dir.absolutePath).availableBytes } catch (e: Exception) { -1L }
+        val needMin = 60L * 1024 * 1024 // 外置模型后包体约 20MB，预留 60MB 足够
+        if (free in 0 until needMin) {
+            lastDownloadError = "手机存储空间不足（可用 ${free / 1048576}MB，需至少 ${needMin / 1048576}MB）"
+            return@withContext null
+        }
+        val urls = candidateUrls(url)
+        var lastErr: String? = null
+        for ((i, u) in urls.withIndex()) {
+            var attempt = 0
+            while (attempt < 2) {
+                attempt++
+                try {
+                    val f = downloadOnce(ctx, u, remote.sha256, onProgress)
+                    if (f != null) return@withContext f
+                } catch (e: Exception) {
+                    lastErr = "通道${i + 1}第${attempt}次：${e.message ?: e.javaClass.simpleName}"
+                    android.util.Log.e("MTUpdate", "download $u attempt $attempt failed", e)
+                }
+            }
+        }
+        lastDownloadError = lastErr ?: "未知错误"
         null
     }
 
@@ -270,8 +316,8 @@ object UpdateChecker {
             }
         }
         conn.disconnect()
-        // 校验 1：大小合理（本项目 APK > 100MB）
-        if (part.length() < 10L * 1024 * 1024) {
+        // 校验 1：大小合理（外置模型后包体约 20MB，下限 3MB 防半截文件）
+        if (part.length() < 3L * 1024 * 1024) {
             part.delete()
             throw UpdateException("下载文件过小（${part.length()} 字节），可能不完整")
         }

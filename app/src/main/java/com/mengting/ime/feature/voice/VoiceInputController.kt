@@ -9,6 +9,7 @@ import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import java.io.File
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig
@@ -29,9 +30,10 @@ class VoiceInputController(private val ctx: Context) {
     private var recordThread: Thread? = null
     @Volatile private var running = false
 
-    /** IME 启动时调用：后台预加载模型 */
+    /** IME 启动时调用：模型就绪则后台预加载识别器 */
     fun preload() {
         if (recognizer != null || loading) return
+        if (!ModelStore.isReady(ctx)) return
         loading = true
         thread(name = "mt-asr-load") {
             try {
@@ -46,12 +48,13 @@ class VoiceInputController(private val ctx: Context) {
     }
 
     private fun createRecognizer(): OnlineRecognizer {
+        val dir = ModelStore.modelDir(ctx)
         val model = OnlineModelConfig(
             paraformer = OnlineParaformerModelConfig(
-                encoder = "models/asr/encoder.int8.onnx",
-                decoder = "models/asr/decoder.int8.onnx"
+                encoder = File(dir, "encoder.int8.onnx").absolutePath,
+                decoder = File(dir, "decoder.int8.onnx").absolutePath
             ),
-            tokens = "models/asr/tokens.txt",
+            tokens = File(dir, "tokens.txt").absolutePath,
             numThreads = 2,
             provider = "cpu",
             modelType = "paraformer"
@@ -62,7 +65,8 @@ class VoiceInputController(private val ctx: Context) {
             enableEndpoint = true,
             decodingMethod = "greedy_search"
         )
-        return OnlineRecognizer(ctx.assets, cfg)
+        // AssetManager 传 null：sherpa-onnx 从文件系统绝对路径加载
+        return OnlineRecognizer(null, cfg)
     }
 
     /**
@@ -81,6 +85,10 @@ class VoiceInputController(private val ctx: Context) {
         if (loadFailed) {
             loadFailed = false
             preload()
+        }
+        if (!ModelStore.isReady(ctx)) {
+            notify("语音模型尚未下载完成，请在「梦婷输入法」App 中下载语音模型")
+            return
         }
         running = true
         thread(name = "mt-voice") {

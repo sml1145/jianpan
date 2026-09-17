@@ -11,8 +11,18 @@ android {
         applicationId = "com.mengting.ime"
         minSdk = 24
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.0.7"
+        versionCode = 8
+        versionName = "1.0.8"
+        // 真机只需 arm 双架构；模拟器自检走 debug 构建（不受此过滤影响需单独配置见下）
+        ndk.abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+    }
+
+    // debug 构建保留 x86_64 供模拟器自检
+    buildTypes {
+        debug {
+            ndk.abiFilters.clear()
+            ndk.abiFilters += listOf("x86_64", "arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -41,7 +51,6 @@ android {
 
 dependencies {
     implementation(files("libs/sherpa-onnx-1.13.8.aar"))
-    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.compose.ui:ui")
@@ -50,6 +59,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.fragment:fragment-ktx:1.6.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.8.2")
     implementation("androidx.savedstate:savedstate-ktx:1.2.1")
