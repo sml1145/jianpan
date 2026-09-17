@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -89,12 +90,12 @@ fun KeyboardScreen(host: KeyboardHost) {
     val config = LocalConfiguration.current
     val landscape = config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
 
-    Box(Modifier.fillMaxSize()) {
-        BackgroundLayer()
+    Box(Modifier.fillMaxWidth().wrapContentHeight()) {
+        BackgroundLayer(Modifier.matchParentSize())
         when {
             landscape && state.floating -> FloatingKeyboard(host)
             state.singleHand -> SingleHandKeyboard(host)
-            else -> KeyboardColumn(host, Modifier.fillMaxSize())
+            else -> KeyboardColumn(host, Modifier.fillMaxWidth())
         }
         if (landscape && !state.floating) {
             Box(
@@ -122,7 +123,7 @@ private suspend fun PointerInputScope.forEachGestureSafe(block: () -> Unit) {
 }
 
 @Composable
-private fun BackgroundLayer() {
+private fun BackgroundLayer(modifier: Modifier = Modifier) {
     val uri = AppPrefs.customBackgroundUri
     if (uri.isNotEmpty()) {
         val context = LocalContext.current
@@ -133,10 +134,10 @@ private fun BackgroundLayer() {
             } catch (e: Exception) { null }
         }
         if (bitmap != null) {
-            Image(bitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        } else PixelArtBackground(animOn = AppPrefs.bgAnimationOn)
+            Image(bitmap.asImageBitmap(), null, modifier, contentScale = ContentScale.Crop)
+        } else PixelArtBackground(modifier = modifier, animOn = AppPrefs.bgAnimationOn)
     } else {
-        PixelArtBackground(animOn = AppPrefs.bgAnimationOn)
+        PixelArtBackground(modifier = modifier, animOn = AppPrefs.bgAnimationOn)
     }
 }
 
@@ -146,10 +147,10 @@ private fun SingleHandKeyboard(host: KeyboardHost) {
     val side = remember { GravitySideResolver(context) }
     val alignLeft = side.isLeft()
     Box(
-        Modifier.fillMaxSize(),
+        Modifier.fillMaxWidth(),
         contentAlignment = if (alignLeft) Alignment.BottomStart else Alignment.BottomEnd
     ) {
-        KeyboardColumn(host, Modifier.fillMaxHeight().fillMaxWidth(0.62f))
+        KeyboardColumn(host, Modifier.fillMaxWidth(0.62f))
     }
 }
 

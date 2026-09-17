@@ -7,6 +7,11 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.core.TypingStats
 import com.mengting.ime.feature.audio.KeySoundManager
@@ -14,6 +19,7 @@ import com.mengting.ime.feature.ocr.OcrLauncher
 import com.mengting.ime.feature.translate.TranslateHelper
 import com.mengting.ime.feature.voice.VoiceInputController
 import com.mengting.ime.ui.keyboard.KeyboardHost
+import com.mengting.ime.ui.keyboard.KeyboardScreen
 import com.mengting.ime.ui.keyboard.KeyboardState
 
 /**
@@ -30,6 +36,7 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var sound: KeySoundManager
     private lateinit var voice: VoiceInputController
+    private val imeLifecycle = ImeLifecycleOwner()
 
     // 长按删除左滑全删
     private var deleteLongFired = false
@@ -41,28 +48,43 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         sound = KeySoundManager(this)
         voice = VoiceInputController(this)
         OcrLauncher.pendingInsert = { text -> commitText(text) }
+        imeLifecycle.moveTo(Lifecycle.State.CREATED)
     }
 
     override fun onCreateInputView(): View {
-        return ComposeView(this).apply {
-            setContent { com.mengting.ime.ui.keyboard.KeyboardScreen(this@MengtingIME) }
+        val view = ComposeView(this)
+        // 关键：Compose 的 windowRecomposer 从窗口根子节点向上找 ViewTreeLifecycleOwner，
+        // 必须设置在窗口 decorView 上（IME 的 parentPanel 是系统容器，向上必经 decorView）
+        window.window?.decorView?.let { decor ->
+            decor.setViewTreeLifecycleOwner(imeLifecycle)
+            decor.setViewTreeViewModelStoreOwner(imeLifecycle)
+            decor.setViewTreeSavedStateRegistryOwner(imeLifecycle)
         }
+        view.setViewTreeLifecycleOwner(imeLifecycle)
+        view.setViewTreeViewModelStoreOwner(imeLifecycle)
+        view.setViewTreeSavedStateRegistryOwner(imeLifecycle)
+        view.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+        view.setContent { KeyboardScreen(this) }
+        return view
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        imeLifecycle.moveTo(Lifecycle.State.RESUMED)
         state.reset()
         sound.load()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         voice.stop()
+        imeLifecycle.moveTo(Lifecycle.State.CREATED)
         super.onFinishInputView(finishingInput)
     }
 
     override fun onDestroy() {
         voice.release()
         sound.release()
+        imeLifecycle.destroy()
         super.onDestroy()
     }
 
@@ -95,7 +117,6 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         if (state.composing.isNotEmpty()) {
             state.composing = state.composing.dropLast(1)
             if (state.composing.isEmpty()) ic.finishComposingText() else ic.setComposingText(state.composing, 1)
-            state.refreshCandidates()
         } else {
             ic.deleteSurroundingText(1, 0)
         }
@@ -103,21 +124,16 @@ class MengtingIME : InputMethodService(), KeyboardHost {
 
     override fun deleteAll() {
         val ic = currentInputConnection ?: return
-        // 清空组合
         ic.finishComposingText()
         state.clearComposition()
-        // 选中文本后删除 => 全删
-        val sel = ic.getSelectedText(0)
-        ic.performContextMenuAction(android.R.id.selectAll)
-        ic.deleteSurroundingText(0, 0)
-        ic.deleteSurroundingText(Int.MAX_VALUE, Int.MAX_VALUE)
-        // 兜底：逐段删除
         var guard = 0
-        while (guard++ < 200) {
+        while (guard++ < 100) {
             val before = ic.getTextBeforeCursor(512, 0)
             val after = ic.getTextAfterCursor(512, 0)
-            if (before.isNullOrEmpty() && after.isNullOrEmpty()) break
-            ic.deleteSurroundingText(before?.length ?: 0, after?.length ?: 0)
+            val bl = before?.length ?: 0
+            val al = after?.length ?: 0
+            if (bl == 0 && al == 0) break
+            ic.deleteSurroundingText(bl, al)
         }
     }
 

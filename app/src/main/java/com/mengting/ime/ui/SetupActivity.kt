@@ -30,6 +30,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -68,11 +69,18 @@ class SetupActivity : ComponentActivity() {
 
     private val notifyPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    private var refreshKey by mutableStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33) notifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
         audioPerm.launch(Manifest.permission.RECORD_AUDIO)
         setContent { SetupScreen(bgPicker = { bgPicker.launch("image/*") }) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshKey++
     }
 
     private fun isImeEnabled(): Boolean {
@@ -82,8 +90,14 @@ class SetupActivity : ComponentActivity() {
     }
 
     private fun isImeDefault(): Boolean {
-        val id = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
-        return id == "$packageName/com.mengting.ime.ime.MengtingIME"
+        val id = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) ?: return false
+        // 形如 com.mengting.ime/com.mengting.ime.ime.MengtingIME 或 com.mengting.ime/.ime.MengtingIME
+        return try {
+            val comp = android.content.ComponentName.unflattenFromString(id)
+            comp != null && comp.packageName == packageName
+        } catch (e: Exception) {
+            id.startsWith("$packageName/")
+        }
     }
 
     @Composable
@@ -91,6 +105,10 @@ class SetupActivity : ComponentActivity() {
         val ctx = LocalContext.current
         var enabled by remember { mutableStateOf(isImeEnabled()) }
         var isDefault by remember { mutableStateOf(isImeDefault()) }
+        LaunchedEffect(refreshKey) {
+            enabled = isImeEnabled()
+            isDefault = isImeDefault()
+        }
         var sound by remember { mutableStateOf(AppPrefs.soundOn) }
         var vib by remember { mutableStateOf(AppPrefs.vibrateOn) }
         var net by remember { mutableStateOf(AppPrefs.netBoost) }
