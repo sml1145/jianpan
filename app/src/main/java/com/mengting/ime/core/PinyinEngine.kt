@@ -265,38 +265,39 @@ object PinyinEngine {
     /** 全拼输入串 -> 候选词列表（前缀/简拼/整句全覆盖） */
     fun candidates(input: String, limit: Int = 30): List<String> {
         if (input.isEmpty() || !charsReady) return emptyList()
-        if (input.any { !it.isLetter() }) return emptyList()
+        // 分词符（撇号）仅用于切分歧义，不参与匹配
+        val effective = input.replace("'", "")
+        if (effective.isEmpty() || effective.any { !it.isLetter() }) return emptyList()
         val out = LinkedHashSet<String>()
 
         // 0) 云端热词（联网增强）：精确键 → 简拼
         synchronized(hotByKey) {
-            hotByKey[input]?.let { out.addAll(it) }
-            if (input.length >= 2) hotByInitials[input]?.let { out.addAll(it) }
+            hotByKey[effective]?.let { out.addAll(it) }
+            if (effective.length >= 2) hotByInitials[effective]?.let { out.addAll(it) }
         }
 
         val idx = index
-        if (input.length <= 2) {
+        if (effective.length <= 2) {
             // 短输入：简拼词优先，其次单字（精确音节 → 前缀音节）
-            if (idx != null && input.length == 2) {
-                idx.byInitials[input]?.let { arr ->
+            if (idx != null && effective.length == 2) {
+                idx.byInitials[effective]?.let { arr ->
                     for (i in arr) if (out.size < limit) out.add(idx.words[i])
                 }
             }
-            addCharsFor(out, input, limit)
-            // 前缀词（如 "sa" 前缀的词）
-            if (idx != null) addPrefixWords(idx, out, input, limit, 6)
+            addCharsFor(out, effective, limit)
+            if (idx != null) addPrefixWords(idx, out, effective, limit, 6)
         } else {
             // 长输入：整句切分 → 前缀词 → 简拼词 → 单字
             if (idx != null) {
-                for (w in segmentTop(input, idx, 4)) if (out.size < limit) out.add(w)
-                addPrefixWords(idx, out, input, limit, 10)
-                idx.byInitials[input]?.let { arr ->
+                for (w in segmentTop(effective, idx, 4)) if (out.size < limit) out.add(w)
+                addPrefixWords(idx, out, effective, limit, 10)
+                idx.byInitials[effective]?.let { arr ->
                     for (i in arr.take(6)) if (out.size < limit) out.add(idx.words[i])
                 }
             } else {
-                for (w in fallbackSplit(input)) if (out.size < limit) out.add(w)
+                for (w in fallbackSplit(effective)) if (out.size < limit) out.add(w)
             }
-            addCharsFor(out, input, limit)
+            addCharsFor(out, effective, limit)
         }
         return out.toList().take(limit)
     }

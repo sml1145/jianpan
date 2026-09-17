@@ -15,6 +15,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -200,8 +201,14 @@ class SetupActivity : ComponentActivity() {
         var showUpdateDialog by remember { mutableStateOf(false) }
         var showBrowserFallback by remember { mutableStateOf(false) }
         var showWidgetHelp by remember { mutableStateOf(false) }
+        var widgetChars by remember { mutableIntStateOf(0) }
+        var widgetMood by remember { mutableStateOf(Triple(0, 0, 100)) }
         val scope = rememberCoroutineScope()
         val localVer = remember { UpdateChecker.localVersion(ctx) }
+        LaunchedEffect(refreshKey) {
+            widgetChars = com.mengting.ime.core.TypingStats.todayChars()
+            widgetMood = com.mengting.ime.core.TypingStats.moodPercents()
+        }
 
         fun startDownload(remote: UpdateChecker.Remote) {
             showUpdateDialog = false
@@ -218,6 +225,7 @@ class SetupActivity : ComponentActivity() {
             UpdateChecker.startDownload(
                 ctx, remote,
                 onProgress = { p -> progress = p },
+                onSlow = { msg -> updateMsg = msg },
                 onDone = { f ->
                     downloading = false
                     if (f != null) {
@@ -248,8 +256,15 @@ class SetupActivity : ComponentActivity() {
                         Text("‹ 返回", fontSize = 16.sp, color = Color(0xFFB23A8F), fontWeight = FontWeight.Bold,
                             modifier = Modifier.clickable { subPage = 0 }.padding(vertical = 4.dp, horizontal = 2.dp))
                         Spacer(Modifier.width(12.dp))
-                        Text(if (subPage == 1) "前置准备" else "键盘设置", fontSize = 20.sp,
-                            fontWeight = FontWeight.Black, color = Color(0xFF4A2B5A))
+                        Text(
+                            when (subPage) {
+                                1 -> "前置准备"
+                                2 -> "键盘设置"
+                                else -> "单手模式"
+                            },
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Black, color = Color(0xFF4A2B5A)
+                        )
                     }
                     Spacer(Modifier.height(8.dp))
                 }
@@ -372,21 +387,12 @@ class SetupActivity : ComponentActivity() {
                             ) { Text("下载语音模型") }
                         }
                     }
-                    else -> {
-                        // ===== 主页 =====
-                        Text("梦婷输入法", fontSize = 26.sp, fontWeight = FontWeight.Black, color = Color(0xFFB23A8F))
-                        Text(updateMsg, fontSize = 12.sp, color = Color(0xFF8A6B7A))
-                        Spacer(Modifier.height(14.dp))
-
-                        MainCard("🚀 前置准备",
-                            subtitle = { Text("启用输入法并设为默认（首次使用必读）", fontSize = 12.sp, color = Color(0xFF6B5670)) },
-                            onClick = { subPage = 1 })
-
-                        MainCard("⌨ 键盘设置",
-                            subtitle = { Text("键盘外观、按键颜色、音效振动、联网增强", fontSize = 12.sp, color = Color(0xFF6B5670)) },
-                            onClick = { subPage = 2 })
-
+                    3 -> {
+                        // ===== 副页：单手模式 =====
                         Section("单手模式")
+                        Text("键盘底部「单手」键开启；开启后键盘收窄偏向一侧，按键纵向排列便于单手握持。",
+                            fontSize = 12.sp, color = Color(0xFF6B5670))
+                        Spacer(Modifier.height(8.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("默认偏向：", fontSize = 14.sp)
                             for ((v, label) in listOf(0 to "重力感应", 1 to "左", 2 to "右")) {
@@ -398,8 +404,28 @@ class SetupActivity : ComponentActivity() {
                             }
                         }
                         SwitchRow("重力偏向逆转（左下→偏右）", invert) { invert = it; AppPrefs.singleHandInvert = it }
-                        Text("提示：单手模式在键盘底部「单手」键开启；左右倾斜手机即可切换偏向。",
+                        Text("提示：选择「重力感应」时，左右倾斜手机即可实时切换偏向；无倾斜时默认偏右。",
                             fontSize = 11.sp, color = Color(0xFF8A6B7A))
+                    }
+                    else -> {
+                        // ===== 主页 =====
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("梦婷输入法", fontSize = 26.sp, fontWeight = FontWeight.Black, color = Color(0xFFB23A8F))
+                            Text(updateMsg, fontSize = 12.sp, color = Color(0xFF8A6B7A), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                        }
+                        Spacer(Modifier.height(14.dp))
+
+                        MainCard("🚀 前置准备",
+                            subtitle = { Text("启用输入法并设为默认（首次使用必读）", fontSize = 12.sp, color = Color(0xFF6B5670)) },
+                            onClick = { subPage = 1 })
+
+                        MainCard("⌨ 键盘设置",
+                            subtitle = { Text("键盘外观、按键颜色、音效振动、联网增强", fontSize = 12.sp, color = Color(0xFF6B5670)) },
+                            onClick = { subPage = 2 })
+
+                        MainCard("🖐 单手模式",
+                            subtitle = { Text("默认偏向、重力感应与逆转设置", fontSize = 12.sp, color = Color(0xFF6B5670)) },
+                            onClick = { subPage = 3 })
 
                         Spacer(Modifier.height(14.dp))
                         Section("检查更新")
@@ -482,6 +508,28 @@ class SetupActivity : ComponentActivity() {
                         ) { Text("一键添加到桌面") }
                         Text("没弹出确认框？点这里查看手动添加教程", fontSize = 11.sp, color = Color(0xFFB23A8F),
                             modifier = Modifier.padding(top = 6.dp).clickable { showWidgetHelp = true })
+
+                        Spacer(Modifier.height(10.dp))
+                        // 应用内组件预览：不添加桌面组件也能看到数据
+                        Box(
+                            Modifier.fillMaxWidth()
+                                .background(Color(0xF2FFFFFF), RoundedCornerShape(16.dp))
+                                .border(1.dp, Color(0x33B23A8F), RoundedCornerShape(16.dp))
+                                .padding(16.dp)
+                        ) {
+                            Column {
+                                Text("梦婷输入法", fontSize = 12.sp, color = Color(0xFFB23A8F), fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.height(6.dp))
+                                Text("今天码了 ${widgetChars} 字", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFF3A2440))
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    "开心的内容占比 ${widgetMood.first}%，不开心的内容占比 ${widgetMood.second}%，其他内容占比 ${widgetMood.third}%",
+                                    fontSize = 12.sp, color = Color(0xFF6B5670)
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                Text("每日凌晨 5 点刷新（应用内预览，与桌面组件数据一致）", fontSize = 10.sp, color = Color(0x996B5670))
+                            }
+                        }
 
                         Spacer(Modifier.height(24.dp))
                     }

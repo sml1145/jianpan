@@ -221,15 +221,16 @@ object UpdateChecker {
 
     @Volatile private var downloadJob: kotlinx.coroutines.Job? = null
 
-    /** 启动下载（幂等：已在下载则忽略）；onState 回调进度/结果 */
+    /** 启动下载（幂等：已在下载则忽略）；onProgress 回调进度，onSlow 回调"缓慢"提示 */
     fun startDownload(
         ctx: Context, remote: Remote,
         onProgress: (Int) -> Unit,
+        onSlow: (String) -> Unit = {},
         onDone: (File?) -> Unit
     ) {
         downloadJob?.takeIf { it.isActive }?.let { return }
         downloadJob = downloadScope.launch {
-            val f = download(ctx, remote, onProgress)
+            val f = download(ctx, remote, onProgress, onSlow)
             withContext(Dispatchers.Main) { onDone(f) }
         }
     }
@@ -291,7 +292,8 @@ object UpdateChecker {
 
     suspend fun download(
         ctx: Context, remote: Remote,
-        onProgress: (Int) -> Unit
+        onProgress: (Int) -> Unit,
+        onSlow: (String) -> Unit = {}
     ): File? = withContext(Dispatchers.IO) {
         lastDownloadError = null
         val url = remote.apkUrl
@@ -299,7 +301,7 @@ object UpdateChecker {
             lastDownloadError = "发布页没有安装包附件"
             return@withContext null
         }
-        // 空间预检：期望大小 + 60MB 余量
+        // 空间预检：期望大小 + 20MB 余量
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
         val free = try { android.os.StatFs(dir.absolutePath).availableBytes } catch (e: Exception) { -1L }
         val needMin = (if (remote.apkSize > 0) remote.apkSize * 2 else 60L * 1024 * 1024) + 20L * 1024 * 1024
@@ -315,7 +317,7 @@ object UpdateChecker {
             while (attempt < 2) {
                 attempt++
                 try {
-                    val f = downloadOnce(ctx, u, remote.sha256, remote.apkSize, onProgress)
+                    val f = downloadOnce(ctx, u, remote.sha256, remote.apkSize, onProgress, onSlow)
                     if (f != null) return@withContext f
                 } catch (e: Exception) {
                     lastErr = "通道${i + 1}第${attempt}次：${e.message ?: e.javaClass.simpleName}"
@@ -331,21 +333,23 @@ object UpdateChecker {
 
     private fun downloadOnce(
         ctx: Context, url: String, sha256: String?, expectSize: Long,
-        onProgress: (Int) -> Unit
+        onProgress: (Int) -> Unit,
+        onSlow: (String) -> Unit
     ): File? {
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
         val out = File(dir, "update.apk")
         val part = File(dir, "update.apk.part")
         var resumeFrom = if (part.exists()) part.length() else 0L
-        var conn = open(url, timeoutMs = 20000)
-        conn.readTimeout = 30000
+        // 读超时 12 秒：通道停滞时快速抛错自动切换，不让进度条假死
+        var conn = open(url, timeoutMs = 15000)
+        conn.readTimeout = 12000
         conn.setRequestProperty("Range", "bytes=$resumeFrom-")
         var code = conn.responseCode
         if (code == 416) { // 续传位置越界，重来
             part.delete(); resumeFrom = 0
             conn.disconnect()
-            conn = open(url, timeoutMs = 20000)
-            conn.readTimeout = 30000
+            conn = open(url, timeoutMs = 15000)
+            conn.readTimeout = 12000
             code = conn.responseCode
         }
         if (code == 206) {
@@ -358,6 +362,10 @@ object UpdateChecker {
         }
         val reported = conn.contentLengthLong
         val total = if (reported > 0) reported + resumeFrom else -1L
+        // 速率监控：每秒采样，低于 80KB/s 持续 4 秒提示一次"缓慢"
+        var speedWindowStart = System.currentTimeMillis()
+        var speedWindowBytes = 0L
+        var lastSlowNotify = 0L
         conn.inputStream.use { input ->
             RandomAccessFile(part, "rw").use { raf ->
                 raf.seek(resumeFrom)
@@ -368,9 +376,26 @@ object UpdateChecker {
                 while (input.read(buf).also { n = it } != -1) {
                     raf.write(buf, 0, n)
                     done += n
+                    speedWindowBytes += n
+                    val now = System.currentTimeMillis()
+                    val elapsed = now - speedWindowStart
+                    if (elapsed >= 1000) {
+                        val kbps = speedWindowBytes / 1024 * 1000 / elapsed
+                        if (kbps < 80 && now - lastSlowNotify > 5000) {
+                            lastSlowNotify = now
+                            onSlow("当前下载速度较慢（约 ${kbps}KB/s），正在自动切换更快的通道，请耐心等待…")
+                            // 持续龟速时主动断开，让外层切换通道续传
+                            if (kbps < 15) {
+                                try { input.close() } catch (_: Exception) {}
+                                throw UpdateException("通道速度过慢（${kbps}KB/s），自动切换")
+                            }
+                        }
+                        speedWindowStart = now
+                        speedWindowBytes = 0L
+                    }
                     if (total > 0) {
                         val p = ((done * 100) / total).toInt()
-                        if (p != lastReport && p % 2 == 0) { lastReport = p; onProgress(p) }
+                        if (p != lastReport) { lastReport = p; onProgress(p) }
                     }
                 }
             }

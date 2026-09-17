@@ -60,6 +60,18 @@ class KeyboardState {
     var translateInput by mutableStateOf("")
     var translateResult by mutableStateOf<List<String>>(emptyList())
 
+    /** 翻译输入框常驻：点击激活后键盘输入进入翻译框 */
+    private var translateActiveState by mutableStateOf(false)
+    var translateActive: Boolean
+        get() = translateActiveState
+        set(value) {
+            translateActiveState = value
+            if (!value) {
+                translateInput = ""
+                translateResult = emptyList()
+            }
+        }
+
     /** 长按删除时的全删气泡 */
     var showDeleteBubble by mutableStateOf(false)
 
@@ -93,6 +105,7 @@ class KeyboardState {
         symbolPage = 0
         emojiPage = 0
         showDeleteBubble = false
+        translateActive = false
     }
 }
 
