@@ -118,5 +118,6 @@ interface KeyboardHost {
     fun toggleLayout()
     fun setLayout(mode: Int)
     fun toggleLang()
+    fun hideKeyboard()
     fun context(): android.content.Context
 }

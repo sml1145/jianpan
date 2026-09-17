@@ -5,9 +5,9 @@
         <item name="android:statusBarColor">#FFF6C7E8</item>
     </style>
     <style name="Theme.Mengting.Splash" parent="Theme.Mengting">
-        <item name="android:windowBackground">@android:color/black</item>
-        <item name="android:statusBarColor">@android:color/black</item>
-        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="android:windowBackground">@drawable/splash_bg</item>
+        <item name="android:statusBarColor">#FFF9C9E8</item>
+        <item name="android:navigationBarColor">#FFB7A6F2</item>
     </style>
     <style name="Theme.Mengting.Transparent" parent="Theme.Mengting">
         <item name="android:windowBackground">@android:color/transparent</item>

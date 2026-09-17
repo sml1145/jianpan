@@ -35,26 +35,41 @@ object PinyinEngine {
 
     @Volatile private var index: WordIndex? = null
 
+    /** 词库发布版本流：界面订阅后在索引就绪时补刷候选 */
+    private val _indexVersion = kotlinx.coroutines.flow.MutableStateFlow(0)
+    val indexVersionFlow: kotlinx.coroutines.flow.StateFlow<Int> = _indexVersion
+
     /** 合法音节集合（用于九宫格展开剪枝） */
     private val syllables = HashSet<String>(500)
 
     /** 用户词典：词 -> 加分 */
     private val userBoost = HashMap<String, Int>()
 
-    private const val STAGE1_WORDS = 50000
-    private const val MAX_WORDS = 300000
+    private const val STAGE1_WORDS = 30000
+    private const val MAX_WORDS = 250000
 
     fun ensureLoaded(ctx: Context) {
         if (ready) return
         synchronized(this) {
             if (ready) return
-            loadChars(ctx)
-            charsReady = true
-            ready = true
+            try {
+                loadChars(ctx)
+                charsReady = true
+                ready = true
+            } catch (e: Throwable) {
+                // 加载失败不置 ready，下次调用会重试；记录日志便于诊断
+                android.util.Log.e("MTDict", "loadChars failed", e)
+            }
         }
-        // 词库后台分级加载
-        Thread({ loadWordsStaged(ctx) }, "mt-dict").start()
+        if (ready && !wordsLoading) {
+            wordsLoading = true
+            Thread({
+                try { loadWordsStaged(ctx) } finally { wordsLoading = false }
+            }, "mt-dict").start()
+        }
     }
+
+    @Volatile private var wordsLoading = false
 
     private fun loadChars(ctx: Context) {
         ctx.assets.open("dict/char_pinyin.txt").bufferedReader().useLines { lines ->
@@ -87,20 +102,19 @@ object PinyinEngine {
         var publishedStage1 = false
         var count = 0
         try {
-            ctx.assets.open("dict/word_freq.txt").bufferedReader().useLines { lines ->
+            ctx.assets.open("dict/word_freq_py.txt").bufferedReader().useLines { lines ->
                 for (ln in lines) {
                     if (count >= MAX_WORDS) break
                     val p = ln.split('\t')
-                    if (p.size < 2) continue
-                    val w = p[0]
-                    val fr = p[1].toIntOrNull() ?: continue
-                    if (w.length < 2 || w.length > 6) continue
-                    val key = pinyinOf(w) ?: continue
+                    if (p.size < 3) continue
+                    val key = p[0]
+                    val w = p[1]
+                    val fr = p[2].toIntOrNull() ?: continue
                     val idx = words.size
                     words.add(w); freqs.add(fr)
                     byPy.getOrPut(key) { ArrayList() }.add(idx)
                     count++
-                    // 阶段1：前 5 万高频词先发布
+                    // 阶段1：前 3 万高频词先发布
                     if (!publishedStage1 && count >= STAGE1_WORDS) {
                         publish(words, freqs, byPy)
                         publishedStage1 = true
@@ -125,6 +139,7 @@ object PinyinEngine {
         val mMap = HashMap<String, IntArray>(byPy.size)
         for ((k, v) in byPy) mMap[k] = v.toIntArray()
         index = WordIndex(wArr, fArr, mMap)
+        _indexVersion.value = _indexVersion.value + 1
     }
 
     /** 词的拼音串联（每字取首读音），含未知字返回 null */

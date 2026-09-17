@@ -46,6 +46,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -202,6 +203,10 @@ class SetupActivity : ComponentActivity() {
         }
 
         Box(Modifier.fillMaxSize().background(Color(0xFFFFF7FB))) {
+            // 泡泡仅作背景层：最先绘制，在内容之下
+            if (anim) {
+                PinkBubbleCanvas(Modifier.fillMaxSize().alpha(0.5f))
+            }
             Column(
                 Modifier.fillMaxSize()
                     .verticalScroll(rememberScrollState()).padding(20.dp)
@@ -413,10 +418,6 @@ class SetupActivity : ComponentActivity() {
                         Spacer(Modifier.height(24.dp))
                     }
                 }
-            }
-            // 粉色像素泡泡动画（不拦截触摸）
-            if (anim) {
-                PinkBubbleCanvas(Modifier.fillMaxSize())
             }
         }
 

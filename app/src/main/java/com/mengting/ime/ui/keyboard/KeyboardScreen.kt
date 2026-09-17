@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.core.CalcEval
 import com.mengting.ime.core.ClipboardHistory
+import com.mengting.ime.core.PinyinEngine
 import com.mengting.ime.feature.audio.KeySoundManager
 import com.mengting.ime.feature.sms.SmsCodeHolder
 import com.mengting.ime.ui.background.PixelArtBackground
@@ -364,6 +365,10 @@ private fun TopBar(host: KeyboardHost, onSwitch: () -> Unit) {
             host.playKeySound(KeySoundManager.KIND_TAP)
         }
         Spacer(Modifier.weight(1f))
+        TopBtn("⌄", active = false, onClick = {
+            host.playKeySound(KeySoundManager.KIND_TAP)
+            host.hideKeyboard()
+        })
         TopBtn("⌨", active = false, onClick = onSwitch)
         TopBtn(if (state.isChinese) "中" else "英", active = false,
             onLong = { host.onLangLongPress() }, onClick = { host.toggleLang() })
@@ -385,6 +390,11 @@ private fun TopBtn(label: String, active: Boolean, onLong: (() -> Unit)? = null,
 @Composable
 private fun CandidateBar(host: KeyboardHost) {
     val state = host.state
+    // 词库后台加载完成后自动补刷当前组合的候选
+    val dictVer by PinyinEngine.indexVersionFlow.collectAsState()
+    LaunchedEffect(dictVer) {
+        if (state.composing.isNotEmpty()) state.refreshCandidates()
+    }
     Row(
         Modifier.fillMaxWidth().height(42.dp).background(Color(0x66FFFFFF)),
         verticalAlignment = Alignment.CenterVertically

@@ -1,7 +1,6 @@
 package com.mengting.ime.ui
 
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -10,7 +9,6 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -30,14 +29,10 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.mengting.ime.R
 import kotlin.math.roundToInt
 
 /**
@@ -88,12 +83,6 @@ private fun SplashTimeline(onDone: () -> Unit) {
         onDone()
     }
     val p = t.value
-    val context = LocalContext.current
-    val icon = remember(context) {
-        try {
-            BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher_foreground)
-        } catch (e: Exception) { null }
-    }
 
     // 阶段量（全部 0..1）
     val iconAlpha = ease(seg(p, 0f, 0.18f)) * (1f - 0.8f * ease(seg(p, 0.36f, 0.56f)))
@@ -103,19 +92,24 @@ private fun SplashTimeline(onDone: () -> Unit) {
     val smokeA = seg(p, 0.38f, 0.50f) * (1f - seg(p, 0.64f, 0.82f))
     val textP = seg(p, 0.55f, 0.90f)
 
-    Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-        // 图标 9:16（节点恒在，仅 alpha）
-        if (icon != null) {
-            Image(
-                icon.asImageBitmap(), null,
-                Modifier
-                    .fillMaxHeight(0.72f)
-                    .aspectRatio(9f / 16f)
-                    .alpha(iconAlpha.coerceIn(0f, 1f))
-                    .scale(iconScale),
-                contentScale = ContentScale.Crop
-            )
-        }
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(0xFFFBD5EC), Color(0xFFB7A6F2)))
+        ),
+        contentAlignment = Alignment.Center
+    ) {
+        // 9:16 粉紫渐变底（替代原图标位图，仅 alpha/scale 动效）
+        Box(
+            Modifier
+                .fillMaxHeight(0.72f)
+                .aspectRatio(9f / 16f)
+                .alpha(iconAlpha.coerceIn(0f, 1f))
+                .scale(iconScale)
+                .background(
+                    Brush.linearGradient(listOf(Color(0xFFF9C9E8), Color(0xFF9E8CF0))),
+                    RoundedCornerShape(24.dp)
+                )
+        )
 
         // 烟雾：Canvas 径向渐变粒子（节点恒在；alpha=0 时无视觉）
         Canvas(

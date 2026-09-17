@@ -15,6 +15,7 @@ import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.core.ClipboardHistory
+import com.mengting.ime.core.PinyinEngine
 import com.mengting.ime.core.TypingStats
 import com.mengting.ime.feature.audio.KeySoundManager
 import com.mengting.ime.feature.translate.TranslateHelper
@@ -52,6 +53,8 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         sound = KeySoundManager(this)
         voice = VoiceInputController(this)
         voice.preload()
+        // 兜底：IME 进程独立于 App 进程启动时也能加载词典
+        PinyinEngine.ensureLoaded(this)
         imeLifecycle.moveTo(Lifecycle.State.CREATED)
     }
 
@@ -254,5 +257,9 @@ class MengtingIME : InputMethodService(), KeyboardHost {
 
     override fun toggleLang() {
         state.isChinese = !state.isChinese
+    }
+
+    override fun hideKeyboard() {
+        requestHideSelf(0)
     }
 }
