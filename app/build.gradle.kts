@@ -11,8 +11,8 @@ android {
         applicationId = "com.mengting.ime"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.0.4"
+        versionCode = 5
+        versionName = "1.0.5"
     }
 
     buildTypes {
@@ -42,6 +42,7 @@ android {
 dependencies {
     implementation(files("libs/sherpa-onnx-1.13.8.aar"))
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")

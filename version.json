@@ -1,7 +1,7 @@
 ﻿{
-    "version":  "v1.0.4",
-    "versionCode":  4,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.4/mengting-ime-v1.0.4.apk",
-    "sha256":  "03b34b94c8a3a956b7cd0472de6c1559047e77bb1b9f16afd2c1f955fddb9525",
-    "notes":  "Fix: crash (flash-back) when opening the app (rewrote the splash animation with a fixed node tree)."
+    "version":  "v1.0.5",
+    "versionCode":  5,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.5/mengting-ime-v1.0.5.apk",
+    "sha256":  "251333135a801e374b6ddcb4af3e6e459f49a0dfd3458f5cf64113be00399c56",
+    "notes":  "18 项键盘优化：表情/符号面板返回键与全量扩充、剪切板一键输入、翻译面板、手写键盘、全选复制、全删气泡、单手布局修正、重力感应修复、大小写锁定、英文自动拼词、设置页副页重构、组件一键添加、音效振动默认关+三音效包。"
 }

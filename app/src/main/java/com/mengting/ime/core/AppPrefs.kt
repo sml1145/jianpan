@@ -32,13 +32,19 @@ object AppPrefs {
         get() = sp.getBoolean("single_hand_invert", false)
         set(v) = sp.edit().putBoolean("single_hand_invert", v).apply()
 
+    // 按键音效/振动默认关闭
     var soundOn: Boolean
-        get() = sp.getBoolean("sound_on", true)
+        get() = sp.getBoolean("sound_on", false)
         set(v) = sp.edit().putBoolean("sound_on", v).apply()
 
     var vibrateOn: Boolean
-        get() = sp.getBoolean("vibrate_on", true)
+        get() = sp.getBoolean("vibrate_on", false)
         set(v) = sp.edit().putBoolean("vibrate_on", v).apply()
+
+    // 音效包：0=清脆 1=机械 2=泡泡
+    var soundPack: Int
+        get() = sp.getInt("sound_pack", 0)
+        set(v) = sp.edit().putInt("sound_pack", v).apply()
 
     // 联网增强词库，默认开启
     var netBoost: Boolean
@@ -49,7 +55,7 @@ object AppPrefs {
         get() = sp.getBoolean("bg_anim_on", true)
         set(v) = sp.edit().putBoolean("bg_anim_on", v).apply()
 
-    // 键盘布局：0=全键盘 1=九宫格
+    // 键盘类型：0=26键全键盘 1=九宫格 2=手写
     var layoutMode: Int
         get() = sp.getInt("layout_mode", 0)
         set(v) = sp.edit().putInt("layout_mode", v).apply()

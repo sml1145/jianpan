@@ -1,5 +1,6 @@
 package com.mengting.ime.ime
 
+import android.content.Context
 import android.inputmethodservice.InputMethodService
 import android.os.Handler
 import android.os.Looper
@@ -13,9 +14,9 @@ import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.mengting.ime.core.AppPrefs
+import com.mengting.ime.core.ClipboardHistory
 import com.mengting.ime.core.TypingStats
 import com.mengting.ime.feature.audio.KeySoundManager
-import com.mengting.ime.feature.ocr.OcrLauncher
 import com.mengting.ime.feature.translate.TranslateHelper
 import com.mengting.ime.feature.voice.VoiceInputController
 import com.mengting.ime.ui.keyboard.KeyboardHost
@@ -25,10 +26,9 @@ import com.mengting.ime.ui.keyboard.KeyboardState
 /**
  * 梦婷输入法主服务。
  * 手势约定：
- *  - 长按空格：启动语音转文字
- *  - 长按删除并向左滑动：清空输入框全部内容
+ *  - 长按空格：启动语音转文字（松开停止）
+ *  - 长按删除并向左滑动：清空输入框全部内容（显示全删气泡）
  *  - 长按中英切换：全局翻译当前输入框文本
- *  - 长按句号：提取屏幕文字
  */
 class MengtingIME : InputMethodService(), KeyboardHost {
 
@@ -42,19 +42,21 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     private var deleteLongFired = false
     private var deleteDownX = 0f
     private var deleteDownY = 0f
+    private val deleteLongRunnable = Runnable {
+        deleteLongFired = true
+        state.showDeleteBubble = true
+    }
 
     override fun onCreate() {
         super.onCreate()
         sound = KeySoundManager(this)
         voice = VoiceInputController(this)
-        OcrLauncher.pendingInsert = { text -> commitText(text) }
+        voice.preload()
         imeLifecycle.moveTo(Lifecycle.State.CREATED)
     }
 
     override fun onCreateInputView(): View {
         val view = ComposeView(this)
-        // 关键：Compose 的 windowRecomposer 从窗口根子节点向上找 ViewTreeLifecycleOwner，
-        // 必须设置在窗口 decorView 上（IME 的 parentPanel 是系统容器，向上必经 decorView）
         window.window?.decorView?.let { decor ->
             decor.setViewTreeLifecycleOwner(imeLifecycle)
             decor.setViewTreeViewModelStoreOwner(imeLifecycle)
@@ -73,6 +75,7 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         imeLifecycle.moveTo(Lifecycle.State.RESUMED)
         state.reset()
         sound.load()
+        ClipboardHistory.captureCurrent(this)
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
@@ -90,6 +93,8 @@ class MengtingIME : InputMethodService(), KeyboardHost {
 
     // ---------- KeyboardHost 实现 ----------
 
+    override fun context(): Context = this
+
     override fun playKeySound(kind: Int) {
         if (AppPrefs.soundOn) sound.play(kind)
         if (AppPrefs.vibrateOn) vibrate(kind)
@@ -106,6 +111,7 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         currentInputConnection?.commitText(text, 1)
         TypingStats.onWordCommitted(text)
         state.clearComposition()
+        if (state.capsMode == 1) state.capsMode = 0
     }
 
     override fun setComposing(text: String) {
@@ -126,15 +132,29 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         val ic = currentInputConnection ?: return
         ic.finishComposingText()
         state.clearComposition()
+        ic.performContextMenuAction(android.R.id.selectAll)
+        ic.commitText("", 1)
+        ic.deleteSurroundingText(Int.MAX_VALUE, Int.MAX_VALUE)
         var guard = 0
-        while (guard++ < 100) {
-            val before = ic.getTextBeforeCursor(512, 0)
-            val after = ic.getTextAfterCursor(512, 0)
+        while (guard++ < 60) {
+            val before = ic.getTextBeforeCursor(1024, 0)
+            val after = ic.getTextAfterCursor(1024, 0)
             val bl = before?.length ?: 0
             val al = after?.length ?: 0
             if (bl == 0 && al == 0) break
             ic.deleteSurroundingText(bl, al)
         }
+    }
+
+    override fun selectAll() {
+        currentInputConnection?.performContextMenuAction(android.R.id.selectAll)
+    }
+
+    override fun copySelection() {
+        val ic = currentInputConnection ?: return
+        ic.performContextMenuAction(android.R.id.copy)
+        // 复制结果进剪贴板历史（延迟读系统剪贴板）
+        handler.postDelayed({ ClipboardHistory.captureCurrent(this) }, 300)
     }
 
     override fun moveCursor(delta: Int) {
@@ -154,18 +174,43 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     }
 
     override fun onSpaceLongPress() {
-        voice.start { text -> if (text.isNotBlank()) commitText(text) }
+        state.listening = true
+        var committed = 0
+        voice.start(
+            onResult = { text ->
+                // 增量结果：回退已提交部分再提交新文本
+                val ic = currentInputConnection ?: return@start
+                if (committed > 0) {
+                    ic.deleteSurroundingText(committed, 0)
+                    committed = 0
+                }
+                if (text.isNotBlank()) {
+                    ic.commitText(text, 1)
+                    committed = text.length
+                }
+            },
+            onStatus = { msg -> state.voiceStatus = msg }
+        )
+    }
+
+    override fun onSpaceRelease() {
+        if (state.listening) {
+            state.listening = false
+            voice.stop()
+            TypingStats.onCharCommitted(0)
+        }
     }
 
     override fun onDeleteDown(x: Float, y: Float) {
         deleteLongFired = false
         deleteDownX = x; deleteDownY = y
-        handler.postDelayed({ deleteLongFired = true }, 450)
+        handler.postDelayed(deleteLongRunnable, 400)
     }
 
     override fun onDeleteMove(x: Float, y: Float): Boolean {
-        if (deleteLongFired && (deleteDownX - x) > 80f && Math.abs(y - deleteDownY) < 120f) {
+        if (deleteLongFired && (deleteDownX - x) > 60f && Math.abs(y - deleteDownY) < 160f) {
             deleteLongFired = false
+            state.showDeleteBubble = false
             deleteAll()
             playKeySound(KeySoundManager.KIND_DELETE)
             return true
@@ -174,7 +219,9 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     }
 
     override fun onDeleteUp() {
-        handler.removeCallbacksAndMessages(null)
+        handler.removeCallbacks(deleteLongRunnable)
+        deleteLongFired = false
+        state.showDeleteBubble = false
     }
 
     override fun onLangLongPress() {
@@ -188,17 +235,24 @@ class MengtingIME : InputMethodService(), KeyboardHost {
         }
     }
 
-    override fun onPeriodLongPress() {
-        OcrLauncher.start(this)
+    override fun translateText(text: String, onResult: (List<String>) -> Unit) {
+        TranslateHelper.translateText(text, onResult)
     }
 
     override fun toggleLayout() {
-        AppPrefs.layoutMode = if (AppPrefs.layoutMode == 0) 1 else 0
-        state.layoutVersion++
+        val next = (AppPrefs.layoutMode + 1) % 3
+        AppPrefs.layoutMode = next
+        state.layoutVersion = next
+        state.clearComposition()
+    }
+
+    override fun setLayout(mode: Int) {
+        AppPrefs.layoutMode = mode
+        state.layoutVersion = mode
+        state.clearComposition()
     }
 
     override fun toggleLang() {
         state.isChinese = !state.isChinese
-        state.clearComposition()
     }
 }

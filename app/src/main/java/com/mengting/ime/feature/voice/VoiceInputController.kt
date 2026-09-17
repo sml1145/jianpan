@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
@@ -13,114 +15,139 @@ import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
 import kotlin.concurrent.thread
 
 /**
  * 本地离线语音转文字：sherpa-onnx 流式 zipformer 中英模型。
- * 长按空格触发；识别结束把文本回提交。
+ * 长按空格触发（松开停止）；模型后台预加载，避免首次长按等待。
  */
 class VoiceInputController(private val ctx: Context) {
 
-    private var recognizer: OnlineRecognizer? = null
+    @Volatile private var recognizer: OnlineRecognizer? = null
+    @Volatile private var loading = false
+    @Volatile private var loadFailed = false
     private var recordThread: Thread? = null
     @Volatile private var running = false
-    private var job: Job? = null
 
-    private fun ensureRecognizer(): OnlineRecognizer? {
-        recognizer?.let { return it }
-        return try {
-            val model = OnlineModelConfig(
-                transducer = OnlineTransducerModelConfig(
-                    encoder = "models/asr/encoder.int8.onnx",
-                    decoder = "models/asr/decoder.int8.onnx",
-                    joiner = "models/asr/joiner.int8.onnx"
-                ),
-                tokens = "models/asr/tokens.txt",
-                numThreads = 2,
-                provider = "cpu",
-                modelType = "zipformer"
-            )
-            val cfg = OnlineRecognizerConfig(
-                featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
-                modelConfig = model,
-                enableEndpoint = true,
-                decodingMethod = "greedy_search"
-            )
-            val r = OnlineRecognizer(ctx.assets, cfg)
-            recognizer = r
-            r
-        } catch (e: Throwable) {
-            null
+    /** IME 启动时调用：后台预加载模型 */
+    fun preload() {
+        if (recognizer != null || loading) return
+        loading = true
+        thread(name = "mt-asr-load") {
+            try {
+                recognizer = createRecognizer()
+            } catch (e: Throwable) {
+                loadFailed = true
+                android.util.Log.e("MTVoice", "model load failed", e)
+            } finally {
+                loading = false
+            }
         }
     }
 
-    fun start(onResult: (String) -> Unit) {
+    private fun createRecognizer(): OnlineRecognizer {
+        val model = OnlineModelConfig(
+            transducer = OnlineTransducerModelConfig(
+                encoder = "models/asr/encoder.int8.onnx",
+                decoder = "models/asr/decoder.int8.onnx",
+                joiner = "models/asr/joiner.int8.onnx"
+            ),
+            tokens = "models/asr/tokens.txt",
+            numThreads = 2,
+            provider = "cpu",
+            modelType = "zipformer"
+        )
+        val cfg = OnlineRecognizerConfig(
+            featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
+            modelConfig = model,
+            enableEndpoint = true,
+            decodingMethod = "greedy_search"
+        )
+        return OnlineRecognizer(ctx.assets, cfg)
+    }
+
+    /**
+     * 开始听写。onResult 回调可能多次（增量结果）。
+     * onStatus 回调状态文本，供 UI 展示（权限缺失/加载中/失败）。
+     */
+    fun start(onResult: (String) -> Unit, onStatus: ((String) -> Unit)? = null) {
         if (running) return
+        val notify: (String) -> Unit = { msg ->
+            Handler(Looper.getMainLooper()).post { onStatus?.invoke(msg) }
+        }
         if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            // IME 无法直接请求权限：通过设置页 Activity 请求；此处提示由 UI 层处理
-            onResult("")
+            notify("缺少麦克风权限，请到「梦婷输入法」App 授权")
             return
         }
-        val rec = ensureRecognizer() ?: run { onResult(""); return }
+        if (loadFailed) {
+            loadFailed = false
+            preload()
+        }
         running = true
-        recordThread = thread(name = "mt-voice") {
-            val bufSize = AudioRecord.getMinBufferSize(
-                16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-            )
-            val record = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.MIC, 16000,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize * 2
-                )
-            } catch (e: Exception) { null }
-            if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
-                running = false
-                return@thread
-            }
-            val stream: OnlineStream = rec.createStream("")
-            val pcm = ShortArray(bufSize / 2)
-            val floats = FloatArray(bufSize / 2)
-            val sb = StringBuilder()
-            record.startRecording()
+        thread(name = "mt-voice") {
             try {
-                while (running) {
-                    val n = record.read(pcm, 0, pcm.size)
-                    if (n <= 0) continue
-                    for (i in 0 until n) floats[i] = pcm[i] / 32768f
-                    stream.acceptWaveform(floats.copyOf(n), 16000)
-                    while (rec.isReady(stream)) rec.decode(stream)
-                    val text = rec.getResult(stream).text
-                    if (rec.isEndpoint(stream)) {
-                        if (text.isNotBlank()) {
-                            sb.append(text)
-                            val snapshot = sb.toString()
-                            CoroutineScope(Dispatchers.Main).launch { onResult(snapshot) }
-                        }
-                        rec.reset(stream)
-                    }
+                val rec = recognizer ?: createRecognizer().also { recognizer = it }
+                val bufSize = AudioRecord.getMinBufferSize(
+                    16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+                val record = try {
+                    AudioRecord(
+                        MediaRecorder.AudioSource.MIC, 16000,
+                        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize * 2
+                    )
+                } catch (e: Exception) { null }
+                if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                    running = false
+                    notify("无法启动麦克风")
+                    return@thread
                 }
-                stream.inputFinished()
-                while (rec.isReady(stream)) rec.decode(stream)
-                val tail = rec.getResult(stream).text
-                if (tail.isNotBlank()) sb.append(tail)
-            } catch (_: Exception) {
-            } finally {
-                try { record.stop(); record.release() } catch (_: Exception) {}
-                try { stream.release() } catch (_: Exception) {}
-                val final = sb.toString()
+                val stream: OnlineStream = rec.createStream("")
+                val pcm = ShortArray(bufSize / 2)
+                val floats = FloatArray(bufSize / 2)
+                val sb = StringBuilder()
+                var lastSent = ""
+                record.startRecording()
+                notify("") // 开始听写，清除状态
+                try {
+                    while (running) {
+                        val n = record.read(pcm, 0, pcm.size)
+                        if (n <= 0) continue
+                        for (i in 0 until n) floats[i] = pcm[i] / 32768f
+                        stream.acceptWaveform(floats.copyOf(n), 16000)
+                        while (rec.isReady(stream)) rec.decode(stream)
+                        val text = rec.getResult(stream).text
+                        if (text.isNotBlank() && text != lastSent) {
+                            lastSent = text
+                            val snapshot = (sb.toString() + text)
+                            Handler(Looper.getMainLooper()).post { onResult(snapshot) }
+                        }
+                        if (rec.isEndpoint(stream)) {
+                            if (text.isNotBlank()) sb.append(text)
+                            rec.reset(stream)
+                            lastSent = ""
+                        }
+                    }
+                    stream.inputFinished()
+                    while (rec.isReady(stream)) rec.decode(stream)
+                    val tail = rec.getResult(stream).text
+                    if (tail.isNotBlank()) sb.append(tail)
+                    val final = sb.toString()
+                    if (final.isNotBlank()) Handler(Looper.getMainLooper()).post { onResult(final) }
+                } finally {
+                    try { record.stop(); record.release() } catch (_: Exception) {}
+                    try { stream.release() } catch (_: Exception) {}
+                    running = false
+                }
+            } catch (e: Throwable) {
                 running = false
-                if (final.isNotBlank()) CoroutineScope(Dispatchers.Main).launch { onResult(final) }
+                android.util.Log.e("MTVoice", "voice failed", e)
+                notify("语音模型加载失败：${e.message?.take(80)}")
             }
         }
     }
 
     fun stop() {
         running = false
-        recordThread?.join(800)
         recordThread = null
     }
 
