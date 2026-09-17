@@ -1,7 +1,7 @@
 ﻿{
-    "version":  "v1.0.5",
-    "versionCode":  5,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.5/mengting-ime-v1.0.5.apk",
-    "sha256":  "251333135a801e374b6ddcb4af3e6e459f49a0dfd3458f5cf64113be00399c56",
-    "notes":  "18 项键盘优化：表情/符号面板返回键与全量扩充、剪切板一键输入、翻译面板、手写键盘、全选复制、全删气泡、单手布局修正、重力感应修复、大小写锁定、英文自动拼词、设置页副页重构、组件一键添加、音效振动默认关+三音效包。"
+    "version":  "v1.0.6",
+    "versionCode":  6,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.6/mengting-ime-v1.0.6.apk",
+    "sha256":  "af159cfdc710aabea9f87336492418c1d102cf8503669d42c256ec48591a37e2",
+    "notes":  "16项优化：组件添加教程兜底、单手补中英切换、词库分级加载中文即时出词、大写生效、翻页修复、右下回车、短信验证码气泡、音效切换试听、返回键两级导航、设置页像素泡泡、开屏动画仅冷启动、计算器键盘、Paraformer语音模型、剪/表按钮、26键等宽。"
 }

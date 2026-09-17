@@ -53,8 +53,18 @@ import kotlin.math.roundToInt
  *  0.88-1.00 定格后进入引导页
  */
 class SplashActivity : ComponentActivity() {
+    companion object {
+        /** 进程存活期间只播一次开屏动画；进程被杀重启（真正关闭后再打开）才重新播放 */
+        private var hasPlayed = false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (hasPlayed) {
+            goNext()
+            return
+        }
+        hasPlayed = true
         setContent { SplashTimeline { goNext() } }
     }
 

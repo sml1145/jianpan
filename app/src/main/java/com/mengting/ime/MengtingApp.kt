@@ -5,6 +5,7 @@ import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.core.EnglishEngine
 import com.mengting.ime.core.PinyinEngine
 import com.mengting.ime.core.TypingStats
+import com.mengting.ime.feature.sms.SmsCodeHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,6 +23,7 @@ class MengtingApp : Application() {
         instance = this
         AppPrefs.init(this)
         TypingStats.init(this)
+        SmsCodeHolder.register(this)
         scope.launch { PinyinEngine.ensureLoaded(this@MengtingApp) }
         scope.launch { EnglishEngine.ensureLoaded(this@MengtingApp) }
     }

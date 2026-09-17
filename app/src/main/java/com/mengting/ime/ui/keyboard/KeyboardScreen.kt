@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,7 +13,6 @@ import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -28,6 +28,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -39,7 +40,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -50,8 +50,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mengting.ime.core.AppPrefs
+import com.mengting.ime.core.CalcEval
 import com.mengting.ime.core.ClipboardHistory
 import com.mengting.ime.feature.audio.KeySoundManager
+import com.mengting.ime.feature.sms.SmsCodeHolder
 import com.mengting.ime.ui.background.PixelArtBackground
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -67,7 +69,6 @@ private val QWERTY = listOf(
 private val T9 = listOf(
     listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9"), listOf("*", "0", "#")
 )
-// 单手模式基础键（26字母+空格逗号句号回车删除+大小写）
 private val ONE_HAND = listOf(
     listOf("q", "w", "e", "r", "t", "y"),
     listOf("u", "i", "o", "p", "a", "s"),
@@ -131,20 +132,22 @@ object KeyMetrics {
 fun KeyboardScreen(host: KeyboardHost) {
     val state = host.state
     KeyMetrics.keyColor = AppPrefs.keyColor
-    KeyMetrics.heightScale = if (state.singleHand) 1f else 1f
 
     val config = LocalConfiguration.current
     val landscape = config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
     var showLayoutPicker by remember { mutableStateOf(false) }
 
+    // 短信验证码：进入键盘时读取一次并监听变化
+    val sms by SmsCodeHolder.codeFlow.collectAsState()
+    LaunchedEffect(sms) { state.smsCode = sms }
+
     Box(Modifier.fillMaxWidth().wrapContentHeight()) {
         BackgroundLayer(Modifier.matchParentSize())
         when {
-            landscape && state.floating -> FloatingKeyboard(host, { showLayoutPicker = !showLayoutPicker })
-            state.singleHand -> SingleHandKeyboard(host)
-            else -> KeyboardColumn(host, Modifier.fillMaxWidth(), { showLayoutPicker = !showLayoutPicker })
+            landscape && state.floating -> FloatingKeyboard(host) { showLayoutPicker = !showLayoutPicker }
+            state.singleHand -> SingleHandKeyboard(host) { showLayoutPicker = !showLayoutPicker }
+            else -> KeyboardColumn(host, Modifier.fillMaxWidth()) { showLayoutPicker = !showLayoutPicker }
         }
-        // 布局选择浮层
         if (showLayoutPicker) {
             LayoutPicker(
                 current = state.layoutVersion % 3,
@@ -162,6 +165,21 @@ fun KeyboardScreen(host: KeyboardHost) {
                     .padding(horizontal = 12.dp, vertical = 6.dp)
             ) {
                 Text("⌫ 左滑全删", fontSize = 13.sp, color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        }
+        // 短信验证码气泡
+        state.smsCode?.let { code ->
+            Box(
+                Modifier.align(Alignment.TopStart).padding(top = 84.dp, start = 8.dp)
+                    .background(Color(0xFF2E7D32), RoundedCornerShape(16.dp))
+                    .tapOnce {
+                        host.commitText(code)
+                        host.playKeySound(KeySoundManager.KIND_TAP)
+                        SmsCodeHolder.consume()
+                    }
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Text("📩 验证码 $code · 点击输入", fontSize = 13.sp, color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
         // 语音听写提示
@@ -184,24 +202,24 @@ fun KeyboardScreen(host: KeyboardHost) {
             Box(
                 Modifier.align(Alignment.TopEnd).padding(4.dp)
                     .background(Color(0x66FFFFFF), RoundedCornerShape(6.dp))
-                    .pointerTap { state.floating = true }
+                    .tapOnce { state.floating = true }
                     .padding(horizontal = 8.dp, vertical = 4.dp)
             ) { Text("悬浮", fontSize = 11.sp, color = Color(0xFF4A2B5A)) }
         }
     }
 }
 
-private fun Modifier.pointerTap(block: () -> Unit): Modifier = this.pointerInput(Unit) {
-    forEachGestureSafe { block() }
+/** 标准点击手势：抬起触发一次，避免按下即触发导致翻页跳页 */
+private fun Modifier.tapOnce(block: () -> Unit): Modifier = this.pointerInput(Unit) {
+    detectTapGestures(onTap = { block() })
 }
 
-private suspend fun PointerInputScope.forEachGestureSafe(block: () -> Unit) {
-    while (true) {
-        awaitPointerEventScope {
-            awaitFirstDown(requireUnconsumed = false)
-            block()
-        }
-    }
+/** 点击+长按手势 */
+private fun Modifier.tapLong(onLong: (() -> Unit)?, block: () -> Unit): Modifier = this.pointerInput(Unit) {
+    detectTapGestures(
+        onTap = { block() },
+        onLongPress = onLong?.let { { _ -> it() } }
+    )
 }
 
 @Composable
@@ -218,7 +236,7 @@ private fun LayoutPicker(current: Int, onPick: (Int) -> Unit, onDismiss: () -> U
                         if (i == current) Color(0xFFE86AC0) else Color.Transparent,
                         RoundedCornerShape(8.dp)
                     )
-                    .pointerTap { onPick(i) }
+                    .tapOnce { onPick(i) }
                     .padding(horizontal = 18.dp, vertical = 8.dp)
             ) {
                 Text(label, fontSize = 14.sp,
@@ -226,7 +244,7 @@ private fun LayoutPicker(current: Int, onPick: (Int) -> Unit, onDismiss: () -> U
             }
         }
         Box(
-            Modifier.fillMaxWidth().pointerTap { onDismiss() }
+            Modifier.fillMaxWidth().tapOnce { onDismiss() }
                 .padding(horizontal = 18.dp, vertical = 6.dp)
         ) { Text("收起", fontSize = 12.sp, color = Color(0xFF8A6B7A)) }
     }
@@ -252,13 +270,14 @@ private fun BackgroundLayer(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun SingleHandKeyboard(host: KeyboardHost) {
+private fun SingleHandKeyboard(host: KeyboardHost, onSwitch: () -> Unit) {
     val context = LocalContext.current
     val side = remember(context) { GravitySideResolver(context) }
     DisposableEffect(side) { onDispose { side.unregister() } }
     val alignLeft = side.isLeft()
     Box(Modifier.fillMaxWidth(), contentAlignment = if (alignLeft) Alignment.BottomStart else Alignment.BottomEnd) {
-        Column(Modifier.fillMaxWidth(0.58f)) {
+        Column(Modifier.fillMaxWidth(0.62f)) {
+            TopBar(host, onSwitch)
             CandidateBar(host)
             OneHandKeys(host)
             OneHandBottom(host)
@@ -289,9 +308,9 @@ private fun FloatingKeyboard(host: KeyboardHost, onSwitch: () -> Unit) {
         ) {
             Text("  ⠿ 拖拽移动", fontSize = 10.sp, color = Color.White)
             Spacer(Modifier.weight(1f))
-            Text("－", Modifier.pointerTap { scale = (scale - 0.1f).coerceAtLeast(0.5f) }, color = Color.White, fontSize = 13.sp)
-            Text("＋", Modifier.pointerTap { scale = (scale + 0.1f).coerceAtMost(1.2f) }, color = Color.White, fontSize = 13.sp)
-            Text("退出", Modifier.pointerTap { host.state.floating = false }, color = Color.White, fontSize = 10.sp)
+            Text("－", Modifier.tapOnce { scale = (scale - 0.1f).coerceAtLeast(0.5f) }, color = Color.White, fontSize = 13.sp)
+            Text("＋", Modifier.tapOnce { scale = (scale + 0.1f).coerceAtMost(1.2f) }, color = Color.White, fontSize = 13.sp)
+            Text("退出", Modifier.tapOnce { host.state.floating = false }, color = Color.White, fontSize = 10.sp)
         }
         KeyboardColumn(host, Modifier.fillMaxWidth(), onSwitch)
     }
@@ -308,6 +327,7 @@ private fun KeyboardColumn(host: KeyboardHost, modifier: Modifier, onSwitch: () 
             Panel.EMOJI -> EmojiPanel(host)
             Panel.SYMBOLS -> SymbolPanel(host)
             Panel.CLIPBOARD -> ClipboardPanel(host)
+            Panel.CALCULATOR -> CalculatorPanel(host)
             Panel.HANDWRITING -> HandwritingWrap(host)
             else -> when (state.layoutVersion % 3) {
                 1 -> T9Keyboard(host)
@@ -327,7 +347,7 @@ private fun TopBar(host: KeyboardHost, onSwitch: () -> Unit) {
         Modifier.fillMaxWidth().height(40.dp).background(Color(0x55FFFFFF)),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        TopBtn("📋", active = state.panel == Panel.CLIPBOARD) {
+        TopBtn("剪", active = state.panel == Panel.CLIPBOARD) {
             state.panel = if (state.panel == Panel.CLIPBOARD) Panel.NONE else Panel.CLIPBOARD
             host.playKeySound(KeySoundManager.KIND_TAP)
         }
@@ -335,8 +355,12 @@ private fun TopBar(host: KeyboardHost, onSwitch: () -> Unit) {
             state.panel = if (state.panel == Panel.TRANSLATE) Panel.NONE else Panel.TRANSLATE
             host.playKeySound(KeySoundManager.KIND_TAP)
         }
-        TopBtn("☺", active = state.panel == Panel.EMOJI) {
+        TopBtn("表", active = state.panel == Panel.EMOJI) {
             state.panel = if (state.panel == Panel.EMOJI) Panel.NONE else Panel.EMOJI
+            host.playKeySound(KeySoundManager.KIND_TAP)
+        }
+        TopBtn("算", active = state.panel == Panel.CALCULATOR) {
+            state.panel = if (state.panel == Panel.CALCULATOR) Panel.NONE else Panel.CALCULATOR
             host.playKeySound(KeySoundManager.KIND_TAP)
         }
         Spacer(Modifier.weight(1f))
@@ -351,7 +375,7 @@ private fun TopBtn(label: String, active: Boolean, onLong: (() -> Unit)? = null,
     Box(
         Modifier.size(40.dp)
             .background(if (active) Color(0x66E86AC0) else Color.Transparent, RoundedCornerShape(8.dp))
-            .pointerLongTap(onLong, onClick),
+            .tapLong(onLong, onClick),
         contentAlignment = Alignment.Center
     ) { Text(label, fontSize = 15.sp, color = Color(0xFF4A2B5A), fontWeight = FontWeight.Medium) }
 }
@@ -366,8 +390,11 @@ private fun CandidateBar(host: KeyboardHost) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (state.composing.isNotEmpty()) {
-            Text(state.composing, fontSize = 15.sp, color = Color(0xFF5B3A6E),
-                modifier = Modifier.padding(horizontal = 8.dp))
+            Text(
+                if (!state.isChinese && state.capsMode > 0) state.composing.uppercase() else state.composing,
+                fontSize = 15.sp, color = Color(0xFF5B3A6E),
+                modifier = Modifier.padding(horizontal = 8.dp)
+            )
         }
         if (state.candidates.isEmpty() && state.composing.isEmpty()) {
             Text("梦婷输入法", fontSize = 12.sp, color = Color(0x774A2B5A),
@@ -378,7 +405,7 @@ private fun CandidateBar(host: KeyboardHost) {
                 Text(
                     displayCase(state, c), fontSize = 16.sp, color = Color(0xFF2B1B33),
                     modifier = Modifier
-                        .pointerTap { onCandidateClick(host, c) }
+                        .tapOnce { onCandidateClick(host, c) }
                         .padding(horizontal = 12.dp, vertical = 8.dp)
                 )
             }
@@ -387,7 +414,7 @@ private fun CandidateBar(host: KeyboardHost) {
 }
 
 private fun displayCase(state: KeyboardState, c: String): String =
-    if (!state.isChinese && state.capsMode > 0) c.uppercase() else c
+    if (state.capsMode > 0) c.uppercase() else c
 
 private fun onCandidateClick(host: KeyboardHost, c: String) {
     val state = host.state
@@ -424,7 +451,7 @@ private fun TranslatePanel(host: KeyboardHost) {
                 modifier = Modifier.weight(1f)
             )
             Text("✕", fontSize = 15.sp, color = Color(0xFFB23A8F),
-                modifier = Modifier.pointerTap {
+                modifier = Modifier.tapOnce {
                     state.translateInput = ""; state.translateResult = emptyList(); state.panel = Panel.NONE
                 }.padding(horizontal = 6.dp))
         }
@@ -436,7 +463,7 @@ private fun TranslatePanel(host: KeyboardHost) {
                 for (r in state.translateResult.take(3)) {
                     Box(
                         Modifier.background(Color(0xFFE86AC0), RoundedCornerShape(10.dp))
-                            .pointerTap {
+                            .tapOnce {
                                 host.commitText(r)
                                 host.playKeySound(KeySoundManager.KIND_TAP)
                                 state.translateInput = ""
@@ -462,11 +489,11 @@ private fun ClipboardPanel(host: KeyboardHost) {
         Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("剪贴板（最近20条）", fontSize = 12.sp, color = Color(0xFF4A2B5A), fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            Text("刷新", fontSize = 12.sp, color = Color(0xFFB23A8F), modifier = Modifier.pointerTap {
+            Text("刷新", fontSize = 12.sp, color = Color(0xFFB23A8F), modifier = Modifier.tapOnce {
                 ClipboardHistory.captureCurrent(host.context())
                 items = ClipboardHistory.load(host.context())
             }.padding(horizontal = 8.dp))
-            Text("返回", fontSize = 12.sp, color = Color(0xFFB23A8F), modifier = Modifier.pointerTap {
+            Text("返回", fontSize = 12.sp, color = Color(0xFFB23A8F), modifier = Modifier.tapOnce {
                 state.panel = Panel.NONE
             }.padding(horizontal = 8.dp))
         }
@@ -481,7 +508,7 @@ private fun ClipboardPanel(host: KeyboardHost) {
                     Box(
                         Modifier.fillMaxWidth().padding(vertical = 2.dp)
                             .background(Color(0xAAFFFFFF), RoundedCornerShape(8.dp))
-                            .pointerTap {
+                            .tapOnce {
                                 host.commitText(item)
                                 host.playKeySound(KeySoundManager.KIND_TAP)
                             }
@@ -491,6 +518,81 @@ private fun ClipboardPanel(host: KeyboardHost) {
                     }
                 }
             }
+        }
+    }
+}
+
+// ---------- 计算器面板 ----------
+
+@Composable
+private fun CalculatorPanel(host: KeyboardHost) {
+    val state = host.state
+    // 实时计算预览
+    LaunchedEffect(state.calcExpr) {
+        state.calcResult = if (state.calcExpr.isBlank()) "" else {
+            CalcEval.eval(state.calcExpr)?.let { CalcEval.format(it) } ?: ""
+        }
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+        // 显示区（点击结果一键输入）
+        Box(
+            Modifier.fillMaxWidth().height(64.dp).padding(vertical = 4.dp)
+                .background(Color(0xAAFFFFFF), RoundedCornerShape(10.dp))
+                .tapOnce {
+                    val text = if (state.calcResult.isNotBlank()) state.calcResult else state.calcExpr
+                    if (text.isNotBlank()) {
+                        host.commitText(text)
+                        host.playKeySound(KeySoundManager.KIND_TAP)
+                    }
+                }
+                .padding(horizontal = 12.dp),
+            contentAlignment = Alignment.CenterEnd
+        ) {
+            Column(horizontalAlignment = Alignment.End) {
+                Text(state.calcExpr.ifBlank { "0" }, fontSize = 18.sp, color = Color(0xFF2B1B33))
+                if (state.calcResult.isNotBlank()) {
+                    Text("= ${state.calcResult}（点击输入）", fontSize = 14.sp, color = Color(0xFFB23A8F))
+                }
+            }
+        }
+        val rows = listOf(
+            listOf("7", "8", "9", "÷", "%"),
+            listOf("4", "5", "6", "×", "("),
+            listOf("1", "2", "3", "-", ")"),
+            listOf("0", ".", "+", "C", "⌫")
+        )
+        for (row in rows) {
+            Row(Modifier.fillMaxWidth()) {
+                for (k in row) {
+                    KeyBox(k, baseHeight = 44, onClick = {
+                        host.playKeySound(KeySoundManager.KIND_TAP)
+                        when (k) {
+                            "C" -> { state.calcExpr = ""; state.calcResult = "" }
+                            "⌫" -> { state.calcExpr = state.calcExpr.dropLast(1) }
+                            else -> state.calcExpr += k
+                        }
+                    })
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth()) {
+            KeyBox("返回", weight = 1.6f, onClick = {
+                state.panel = Panel.NONE
+                host.playKeySound(KeySoundManager.KIND_TAP)
+            })
+            KeyBox("＝ 计算并输入", weight = 3f, onClick = {
+                val v = CalcEval.eval(state.calcExpr)
+                if (v != null) {
+                    val text = CalcEval.format(v)
+                    host.commitText(text)
+                    host.playKeySound(KeySoundManager.KIND_TAP)
+                    state.calcExpr = ""; state.calcResult = ""
+                }
+            })
+            KeyBox("⏎", weight = 1.4f, onClick = {
+                host.playKeySound(KeySoundManager.KIND_TAP)
+                host.sendEnter()
+            })
         }
     }
 }
@@ -512,17 +614,21 @@ private fun SymbolPanel(host: KeyboardHost) {
             }
         }
         Row(Modifier.fillMaxWidth()) {
-            KeyBox(if (page == 0) "${pages.size}页" else "第${page + 1}页", weight = 1.4f, onClick = {
-                state.symbolPage = (page + 1) % pages.size
-            })
-            KeyBox("‹", onClick = { if (page > 0) state.symbolPage = page - 1 })
-            KeyBox("›", onClick = { if (page < pages.size - 1) state.symbolPage = page + 1 })
-            KeyBox("⌫", weight = 1.2f, onClick = {
-                host.playKeySound(KeySoundManager.KIND_DELETE); panelDelete(host)
-            })
-            KeyBox("返回", weight = 1.6f, onClick = {
+            KeyBox("返回", weight = 1.4f, onClick = {
                 state.panel = Panel.NONE
                 host.playKeySound(KeySoundManager.KIND_TAP)
+            })
+            KeyBox("‹ 上页", weight = 1.3f, onClick = { if (page > 0) state.symbolPage = page - 1 })
+            Text(
+                "${page + 1}/${pages.size}", fontSize = 11.sp, color = Color(0xFF4A2B5A),
+                modifier = Modifier.width(44.dp).padding(top = 14.dp), textAlign = TextAlign.Center
+            )
+            KeyBox("下页 ›", weight = 1.3f, onClick = { if (page < pages.size - 1) state.symbolPage = page + 1 })
+            KeyBox("⌫", weight = 1.1f, onClick = {
+                host.playKeySound(KeySoundManager.KIND_DELETE); panelDelete(host)
+            })
+            KeyBox("⏎", weight = 1.2f, onClick = {
+                host.playKeySound(KeySoundManager.KIND_TAP); host.sendEnter()
             })
         }
     }
@@ -545,17 +651,31 @@ private fun EmojiPanel(host: KeyboardHost) {
             }
         }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(" ${page + 1}/${pages.size}", fontSize = 11.sp, color = Color(0xFF8A6B7A))
+            Box(
+                Modifier.background(Color(0xAAFFFFFF), RoundedCornerShape(10.dp))
+                    .tapOnce { state.panel = Panel.NONE }
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) { Text("返回", fontSize = 12.sp, color = Color(0xFF4A2B5A)) }
             Spacer(Modifier.weight(1f))
-            Text("‹ 上一页", fontSize = 12.sp, color = Color(0xFFB23A8F),
-                modifier = Modifier.pointerTap { if (page > 0) state.emojiPage = page - 1 }.padding(horizontal = 10.dp, vertical = 8.dp))
-            Text("下一页 ›", fontSize = 12.sp, color = Color(0xFFB23A8F),
-                modifier = Modifier.pointerTap { if (page < pages.size - 1) state.emojiPage = page + 1 }.padding(horizontal = 10.dp, vertical = 8.dp))
-            Text("返回键盘", fontSize = 12.sp, color = Color.White,
-                modifier = Modifier.background(Color(0xFFB23A8F), RoundedCornerShape(10.dp))
-                    .pointerTap { state.panel = Panel.NONE; host.playKeySound(KeySoundManager.KIND_TAP) }
-                    .padding(horizontal = 12.dp, vertical = 6.dp))
+            Box(
+                Modifier.background(Color(0xAAFFFFFF), RoundedCornerShape(10.dp))
+                    .tapOnce { if (page > 0) state.emojiPage = page - 1 }
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) { Text("‹ 上页", fontSize = 12.sp, color = Color(0xFF4A2B5A)) }
+            Text(" ${page + 1}/${pages.size} ", fontSize = 11.sp, color = Color(0xFF8A6B7A))
+            Box(
+                Modifier.background(Color(0xAAFFFFFF), RoundedCornerShape(10.dp))
+                    .tapOnce { if (page < pages.size - 1) state.emojiPage = page + 1 }
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) { Text("下页 ›", fontSize = 12.sp, color = Color(0xFF4A2B5A)) }
+            Spacer(Modifier.weight(1f))
+            Box(
+                Modifier.background(Color(0xFFB23A8F), RoundedCornerShape(10.dp))
+                    .tapOnce { host.sendEnter(); host.playKeySound(KeySoundManager.KIND_TAP) }
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            ) { Text("⏎ 回车", fontSize = 12.sp, color = Color.White) }
         }
+        Spacer(Modifier.height(4.dp))
     }
 }
 
@@ -565,9 +685,14 @@ private fun HandwritingWrap(host: KeyboardHost) {
         HandwritingKeyboard(host)
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp)) {
             Spacer(Modifier.weight(1f))
+            Text("⏎ 回车", fontSize = 13.sp, color = Color.White,
+                modifier = Modifier.background(Color(0xFF4A2B5A), RoundedCornerShape(10.dp))
+                    .tapOnce { host.sendEnter() }
+                    .padding(horizontal = 14.dp, vertical = 7.dp))
+            Spacer(Modifier.width(10.dp))
             Text("返回键盘", fontSize = 13.sp, color = Color.White,
                 modifier = Modifier.background(Color(0xFFB23A8F), RoundedCornerShape(10.dp))
-                    .pointerTap {
+                    .tapOnce {
                         host.state.panel = Panel.NONE
                         if (host.state.layoutVersion % 3 == 2) host.setLayout(0)
                     }
@@ -579,16 +704,61 @@ private fun HandwritingWrap(host: KeyboardHost) {
 
 // ---------- 按键组件 ----------
 
+/** 普通按键：抬起触发点击；带 onLong 时支持长按与长按松开（空格语音用） */
 @Composable
 private fun RowScope.KeyBox(
     label: String, weight: Float = 1f, baseHeight: Int = 46,
     onLong: (() -> Unit)? = null,
     onLongRelease: (() -> Unit)? = null,
-    onDown: ((Float, Float) -> Unit)? = null,
-    onMove: ((Float, Float) -> Boolean)? = null,
-    onUp: (() -> Unit)? = null,
     onClick: () -> Unit
 ) {
+    val h = (baseHeight * KeyMetrics.heightScale).roundToInt()
+    val bg = if (KeyMetrics.keyColor != 0) Color(KeyMetrics.keyColor) else Color(0xAAFFFFFF)
+    val gesture: Modifier = if (onLong == null) {
+        Modifier.tapLong(null, onClick)
+    } else {
+        Modifier.pointerInput(Unit) {
+            kotlinx.coroutines.coroutineScope {
+                while (true) {
+                    awaitPointerEventScope {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        var longFired = false
+                        val job = launch {
+                            delay(420)
+                            longFired = true
+                            onLong()
+                        }
+                        var pressed = true
+                        while (pressed) {
+                            val ev = awaitPointerEvent()
+                            pressed = ev.changes.any { it.id == down.id && it.pressed }
+                        }
+                        job.cancel()
+                        if (longFired) onLongRelease?.invoke() else onClick()
+                    }
+                }
+            }
+        }
+    }
+    Box(
+        Modifier
+            .weight(weight)
+            .height(h.dp)
+            .padding(2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(bg)
+            .border(1.dp, Color(0x33B23A8F), RoundedCornerShape(8.dp))
+            .then(gesture),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, fontSize = if (label.length > 2) 12.sp else 16.sp, color = Color(0xFF2B1B33),
+            textAlign = TextAlign.Center, fontWeight = FontWeight.Medium)
+    }
+}
+
+/** 带滑动手势的删除键（长按+左滑全删） */
+@Composable
+private fun RowScope.DeleteKey(host: KeyboardHost, weight: Float = 1.6f, baseHeight: Int = 46) {
     val h = (baseHeight * KeyMetrics.heightScale).roundToInt()
     val bg = if (KeyMetrics.keyColor != 0) Color(KeyMetrics.keyColor) else Color(0xAAFFFFFF)
     Box(
@@ -604,13 +774,12 @@ private fun RowScope.KeyBox(
                     while (true) {
                         awaitPointerEventScope {
                             val down = awaitFirstDown(requireUnconsumed = false)
-                            onDown?.invoke(down.position.x, down.position.y)
+                            host.onDeleteDown(down.position.x, down.position.y)
                             var longFired = false
                             var consumedByMove = false
                             val job = launch {
-                                delay(420)
+                                delay(400)
                                 longFired = true
-                                onLong?.invoke()
                             }
                             var pressed = true
                             while (pressed) {
@@ -618,20 +787,21 @@ private fun RowScope.KeyBox(
                                 for (ch in ev.changes) {
                                     if (ch.id != down.id) continue
                                     if (!ch.pressed) { pressed = false; continue }
-                                    if (longFired && onMove != null) {
-                                        if (onMove(ch.position.x, ch.position.y)) {
-                                            consumedByMove = true
-                                            ch.consume()
-                                        }
+                                    if (longFired && host.onDeleteMove(ch.position.x, ch.position.y)) {
+                                        consumedByMove = true
+                                        ch.consume()
                                     }
                                 }
                             }
                             job.cancel()
-                            onUp?.invoke()
-                            when {
-                                consumedByMove -> {}
-                                longFired -> onLongRelease?.invoke()
-                                else -> onClick()
+                            host.onDeleteUp()
+                            if (!consumedByMove && !longFired) {
+                                host.playKeySound(KeySoundManager.KIND_DELETE)
+                                panelDelete(host)
+                            } else if (longFired && !consumedByMove) {
+                                // 长按但没滑动：执行一次普通删除
+                                host.playKeySound(KeySoundManager.KIND_DELETE)
+                                panelDelete(host)
                             }
                         }
                     }
@@ -639,31 +809,9 @@ private fun RowScope.KeyBox(
             },
         contentAlignment = Alignment.Center
     ) {
-        Text(label, fontSize = if (label.length > 2) 12.sp else 16.sp, color = Color(0xFF2B1B33),
-            textAlign = TextAlign.Center, fontWeight = FontWeight.Medium)
+        Text("⌫", fontSize = 16.sp, color = Color(0xFF2B1B33), fontWeight = FontWeight.Medium)
     }
 }
-
-@Composable
-private fun Modifier.pointerLongTap(onLong: (() -> Unit)?, onClick: () -> Unit): Modifier =
-    this.pointerInput(Unit) {
-        kotlinx.coroutines.coroutineScope {
-            while (true) {
-                awaitPointerEventScope {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    var longFired = false
-                    val job = launch { delay(420); longFired = true; onLong?.invoke() }
-                    var pressed = true
-                    while (pressed) {
-                        val ev = awaitPointerEvent()
-                        pressed = ev.changes.any { it.id == down.id && it.pressed }
-                    }
-                    job.cancel()
-                    if (!longFired) onClick()
-                }
-            }
-        }
-    }
 
 // ---------- 26 键 ----------
 
@@ -671,36 +819,42 @@ private fun Modifier.pointerLongTap(onLong: (() -> Unit)?, onClick: () -> Unit):
 private fun QwertyKeyboard(host: KeyboardHost) {
     val state = host.state
     Column(Modifier.fillMaxWidth().padding(horizontal = 3.dp)) {
-        for ((ri, row) in QWERTY.withIndex()) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                if (ri == 1) Spacer(Modifier.width(14.dp))
-                for (k in row) {
-                    KeyBox(displayCase(state, k), onClick = {
-                        host.playKeySound(KeySoundManager.KIND_TAP)
-                        onChar(host, k)
-                    })
-                }
-                if (ri == 1) Spacer(Modifier.width(14.dp))
-            }
+        // 三行字母：统一 10 等分宽度，26 个字母键大小一致
+        Row(Modifier.fillMaxWidth()) {
+            for (k in QWERTY[0]) LetterKey(host, k)
         }
         Row(Modifier.fillMaxWidth()) {
+            Spacer(Modifier.weight(0.5f))
+            for (k in QWERTY[1]) LetterKey(host, k)
+            Spacer(Modifier.weight(0.5f))
+        }
+        Row(Modifier.fillMaxWidth()) {
+            Spacer(Modifier.weight(1.5f))
+            for (k in QWERTY[2]) LetterKey(host, k)
+            Spacer(Modifier.weight(1.5f))
+        }
+        // 功能行：大写 全选 复制 + 删除
+        Row(Modifier.fillMaxWidth()) {
             KeyBox(capsLabel(state), onClick = {
-                state.capsMode = if (state.capsMode == 0) 1 else 0
+                state.capsMode = when (state.capsMode) { 0 -> 1; 1 -> 2; else -> 0 }
                 host.playKeySound(KeySoundManager.KIND_TAP)
-            }, onLong = { state.capsMode = 2 })
+            })
             KeyBox("全选", onClick = { host.selectAll(); host.playKeySound(KeySoundManager.KIND_TAP) })
             KeyBox("复制", onClick = { host.copySelection(); host.playKeySound(KeySoundManager.KIND_TAP) })
-            Spacer(Modifier.weight(2.4f))
-            KeyBox(
-                "⌫", weight = 1.6f,
-                onDown = { x, y -> host.onDeleteDown(x, y) },
-                onMove = { x, y -> host.onDeleteMove(x, y) },
-                onUp = { host.onDeleteUp() },
-                onClick = { host.playKeySound(KeySoundManager.KIND_DELETE); panelDelete(host) }
-            )
+            Spacer(Modifier.weight(4.4f))
+            DeleteKey(host)
         }
         BottomRow(host)
     }
+}
+
+@Composable
+private fun RowScope.LetterKey(host: KeyboardHost, k: String) {
+    val state = host.state
+    KeyBox(displayCase(state, k), onClick = {
+        host.playKeySound(KeySoundManager.KIND_TAP)
+        onChar(host, k)
+    })
 }
 
 private fun capsLabel(state: KeyboardState) = when (state.capsMode) {
@@ -747,17 +901,26 @@ private fun ColumnScope.BottomRow(host: KeyboardHost) {
             host.sendEnter()
         })
     }
+    // 空格长按语音：释放监听
+    LaunchedEffect(state.listening) {
+        if (state.listening) {
+            delay(60_000) // 兜底自动停止
+            host.onSpaceRelease()
+        }
+    }
 }
 
 private fun onSpaceTap(host: KeyboardHost) {
     val state = host.state
+    if (state.listening) { host.onSpaceRelease(); return }
     if (state.panel == Panel.TRANSLATE) {
         state.translateInput += " "
         return
     }
     if (state.composing.isNotEmpty()) {
-        val word = state.candidates.firstOrNull() ?: state.composing
-        host.commitText(displayCase(state, word))
+        val word = state.candidates.firstOrNull()
+        if (word != null) host.commitText(displayCase(state, word))
+        else host.commitText(displayCase(state, state.composing))
         host.commitText(" ")
     } else {
         host.commitText(" ")
@@ -770,6 +933,10 @@ private fun panelDelete(host: KeyboardHost) {
         state.translateInput = state.translateInput.dropLast(1)
         return
     }
+    if (state.panel == Panel.CALCULATOR) {
+        state.calcExpr = state.calcExpr.dropLast(1)
+        return
+    }
     host.deleteBackward()
 }
 
@@ -777,23 +944,17 @@ private fun flushComposition(host: KeyboardHost) {
     val s = host.state
     if (s.composing.isNotEmpty()) {
         if (s.candidates.isNotEmpty()) host.commitText(displayCase(s, s.candidates.first()))
-        else s.clearComposition()
+        else host.commitText(displayCase(s, s.composing))
     }
 }
 
 private fun onChar(host: KeyboardHost, c: String) {
     val state = host.state
     if (state.panel == Panel.TRANSLATE) {
-        state.translateInput += if (!state.isChinese && state.capsMode > 0) c.uppercase() else c
+        state.translateInput += if (state.capsMode > 0) c.uppercase() else c
         return
     }
-    if (!state.isChinese) {
-        // 英文也进入组合态，候选来自英文词表实现自动拼词
-        state.composing += c.lowercase()
-        host.setComposing(state.composing)
-        return
-    }
-    if (state.layoutVersion % 3 == 2) return
+    // 中英文都进入组合态：中文出拼音候选，英文出拼词候选
     state.composing += c.lowercase()
     host.setComposing(state.composing)
 }
@@ -826,13 +987,7 @@ private fun T9Keyboard(host: KeyboardHost) {
         Row(Modifier.fillMaxWidth()) {
             KeyBox("符", onClick = { state.panel = Panel.SYMBOLS })
             Spacer(Modifier.weight(4f))
-            KeyBox(
-                "⌫", weight = 1.6f,
-                onDown = { x, y -> host.onDeleteDown(x, y) },
-                onMove = { x, y -> host.onDeleteMove(x, y) },
-                onUp = { host.onDeleteUp() },
-                onClick = { host.playKeySound(KeySoundManager.KIND_DELETE); panelDelete(host) }
-            )
+            DeleteKey(host)
         }
         BottomRow(host)
     }
@@ -852,21 +1007,17 @@ private fun OneHandKeys(host: KeyboardHost) {
                         onChar(host, k)
                     })
                 }
+                // 不足 6 键的行补齐占位，保证键宽一致
+                repeat(6 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
         Row(Modifier.fillMaxWidth()) {
             KeyBox(capsLabel(state), onClick = {
-                state.capsMode = if (state.capsMode == 0) 1 else 0
-            }, onLong = { state.capsMode = 2 })
+                state.capsMode = when (state.capsMode) { 0 -> 1; 1 -> 2; else -> 0 }
+            })
             KeyBox("符", onClick = { state.panel = Panel.SYMBOLS })
             Spacer(Modifier.weight(2f))
-            KeyBox(
-                "⌫", weight = 1.4f,
-                onDown = { x, y -> host.onDeleteDown(x, y) },
-                onMove = { x, y -> host.onDeleteMove(x, y) },
-                onUp = { host.onDeleteUp() },
-                onClick = { host.playKeySound(KeySoundManager.KIND_DELETE); panelDelete(host) }
-            )
+            DeleteKey(host, weight = 1.4f)
         }
     }
 }

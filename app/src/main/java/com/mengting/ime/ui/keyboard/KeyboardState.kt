@@ -10,7 +10,7 @@ import com.mengting.ime.core.EnglishEngine
 import com.mengting.ime.core.PinyinEngine
 
 /** 键盘面板 */
-enum class Panel { NONE, SYMBOLS, EMOJI, CLIPBOARD, TRANSLATE, HANDWRITING }
+enum class Panel { NONE, SYMBOLS, EMOJI, CLIPBOARD, TRANSLATE, HANDWRITING, CALCULATOR }
 
 /** 键盘运行时状态 */
 class KeyboardState {
@@ -62,6 +62,13 @@ class KeyboardState {
 
     /** 长按删除时的全删气泡 */
     var showDeleteBubble by mutableStateOf(false)
+
+    /** 捕获到的短信验证码（气泡提示，点击直接输入） */
+    var smsCode by mutableStateOf<String?>(null)
+
+    /** 计算器表达式与结果 */
+    var calcExpr by mutableStateOf("")
+    var calcResult by mutableStateOf("")
 
     fun refreshCandidates() {
         candidates.clear()

@@ -11,14 +11,14 @@ import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
-import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import kotlin.concurrent.thread
 
 /**
- * 本地离线语音转文字：sherpa-onnx 流式 zipformer 中英模型。
+ * 本地离线语音转文字：sherpa-onnx 流式 Paraformer 中英双语模型（中文识别准确率高）。
  * 长按空格触发（松开停止）；模型后台预加载，避免首次长按等待。
  */
 class VoiceInputController(private val ctx: Context) {
@@ -47,15 +47,14 @@ class VoiceInputController(private val ctx: Context) {
 
     private fun createRecognizer(): OnlineRecognizer {
         val model = OnlineModelConfig(
-            transducer = OnlineTransducerModelConfig(
+            paraformer = OnlineParaformerModelConfig(
                 encoder = "models/asr/encoder.int8.onnx",
-                decoder = "models/asr/decoder.int8.onnx",
-                joiner = "models/asr/joiner.int8.onnx"
+                decoder = "models/asr/decoder.int8.onnx"
             ),
             tokens = "models/asr/tokens.txt",
             numThreads = 2,
             provider = "cpu",
-            modelType = "zipformer"
+            modelType = "paraformer"
         )
         val cfg = OnlineRecognizerConfig(
             featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
