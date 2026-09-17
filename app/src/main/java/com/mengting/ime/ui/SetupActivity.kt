@@ -25,10 +25,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -118,7 +121,37 @@ class SetupActivity : ComponentActivity() {
         var keyColor by remember { mutableIntStateOf(AppPrefs.keyColor) }
         var updateMsg by remember { mutableStateOf("当前版本 ${BuildConfig.VERSION_NAME}") }
         var progress by remember { mutableIntStateOf(-1) }
+        var checking by remember { mutableStateOf(false) }
+        var downloading by remember { mutableStateOf(false) }
+        var pendingUpdate by remember { mutableStateOf<UpdateChecker.Remote?>(null) }
+        var showUpdateDialog by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
+        val localVer = remember { UpdateChecker.localVersion(ctx) }
+
+        fun startDownload(remote: UpdateChecker.Remote) {
+            scope.launch {
+                showUpdateDialog = false
+                pendingUpdate = null
+                downloading = true
+                progress = 0
+                updateMsg = "正在下载 ${remote.tag}…"
+                if (!UpdateChecker.canInstallUnknown(ctx)) {
+                    downloading = false
+                    updateMsg = "需要「安装未知应用」权限，授权后请重新检测更新"
+                    UpdateChecker.openUnknownSourcesSettings(ctx)
+                    return@launch
+                }
+                val f = UpdateChecker.download(ctx, remote.apkUrl ?: "", remote.sha256) { p -> progress = p }
+                downloading = false
+                if (f != null) {
+                    progress = -1
+                    updateMsg = "下载完成并通过校验，正在拉起安装 ${remote.tag}"
+                    UpdateChecker.install(ctx, f)
+                } else {
+                    updateMsg = "下载失败：请检查网络后重试"
+                }
+            }
+        }
 
         Column(
             Modifier.fillMaxSize().background(Color(0xFFFFF7FB)).verticalScroll(rememberScrollState()).padding(20.dp)
@@ -163,18 +196,55 @@ class SetupActivity : ComponentActivity() {
                     onClick = { AppPrefs.customBackgroundUri = ""; Toast.makeText(ctx, "已恢复时间动态背景", Toast.LENGTH_SHORT).show() }) { Text("恢复默认") }
             }
             Text("按键颜色", fontSize = 14.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val colors = listOf(0 to "默认", 0xFFE86AC0.toInt() to "粉", 0xFF7EC8F7.toInt() to "蓝", 0xFFFFD54D.toInt() to "黄", 0xFF9C8CFF.toInt() to "紫", 0xFF7ED9A5.toInt() to "绿")
-                for ((c, name) in colors) {
-                    Box(
-                        Modifier
-                            .height(36.dp).weight(1f)
-                            .background(if (c == 0) Color(0xFFEEEEEE) else Color(c), RoundedCornerShape(8.dp))
-                            .clickable { keyColor = c; AppPrefs.keyColor = c }
-                    )
+            val colors = listOf(
+                0 to "默认",
+                0xFFE86AC0.toInt() to "粉",
+                0xFFFF8A9E.toInt() to "桃",
+                0xFFE5533D.toInt() to "红",
+                0xFFFF9F45.toInt() to "橙",
+                0xFFFFD54D.toInt() to "黄",
+                0xFFC9E265.toInt() to "柠绿",
+                0xFF7ED9A5.toInt() to "绿",
+                0xFF3FBFA0.toInt() to "青碧",
+                0xFF6ED3E8.toInt() to "湖蓝",
+                0xFF7EC8F7.toInt() to "天蓝",
+                0xFF4F7DF3.toInt() to "宝蓝",
+                0xFF9C8CFF.toInt() to "淡紫",
+                0xFF7A5AF8.toInt() to "紫",
+                0xFFD96AA7.toInt() to "玫红",
+                0xFF8D6E63.toInt() to "棕",
+                0xFF90A4AE.toInt() to "灰蓝",
+                0xFF37474F.toInt() to "墨"
+            )
+            for (rowColors in colors.chunked(6)) {
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    for ((c, name) in rowColors) {
+                        val selected = keyColor == c
+                        Box(
+                            Modifier
+                                .height(40.dp).weight(1f)
+                                .background(if (c == 0) Color(0xFFEEEEEE) else Color(c), RoundedCornerShape(8.dp))
+                                .then(
+                                    if (selected) Modifier.padding(2.dp)
+                                        .background(Color.Transparent, RoundedCornerShape(6.dp))
+                                    else Modifier
+                                )
+                                .clickable { keyColor = c; AppPrefs.keyColor = c },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (selected) "✓$name" else name,
+                                fontSize = 10.sp,
+                                color = if (selected) Color.White else Color(0xFF3A2440)
+                            )
+                        }
+                    }
                 }
             }
-            Text("(点击色块应用按键颜色，灰=默认半透明白)", fontSize = 11.sp, color = Color(0xFF8A6B7A))
+            Text("(点击色块应用按键颜色，✓为当前选中；灰=默认半透明白)", fontSize = 11.sp, color = Color(0xFF8A6B7A))
 
             Spacer(Modifier.height(10.dp))
             Section("输入体验")
@@ -198,41 +268,98 @@ class SetupActivity : ComponentActivity() {
 
             Spacer(Modifier.height(14.dp))
             Section("检查更新")
+
             Button(
                 modifier = Modifier.fillMaxWidth(),
+                enabled = !checking && !downloading,
                 onClick = {
                     scope.launch {
-                        updateMsg = "正在检测…"
-                        val remote = UpdateChecker.check(ctx)
-                        val local = UpdateChecker.localVersion(ctx)
+                        checking = true
+                        progress = -1
+                        updateMsg = "正在检测更新…"
+                        val result = UpdateChecker.check(ctx)
+                        val remote = result.remote
+                        checking = false
                         if (remote == null) {
-                            updateMsg = "检测失败：无法连接更新源（当前 $local）"
-                        } else if (!UpdateChecker.hasNew(remote, local)) {
-                            updateMsg = "已是最新版本 $local（仓库最新 ${remote.tag}）"
-                        } else {
-                            updateMsg = "发现新版本 ${remote.tag}，开始下载…"
-                            val url = remote.apkUrl
-                            if (url == null) { updateMsg = "新版本无安装包附件"; return@launch }
-                            if (!UpdateChecker.canInstallUnknown(ctx)) {
-                                Toast.makeText(ctx, "请先允许安装未知应用", Toast.LENGTH_LONG).show()
-                                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}")))
-                            }
-                            val f = UpdateChecker.download(ctx, url) { p -> progress = p }
-                            if (f != null) {
-                                updateMsg = "下载完成，跳转安装 ${remote.tag}"
-                                UpdateChecker.install(ctx, f)
-                            } else updateMsg = "下载失败，请稍后重试"
+                            updateMsg = "检测失败（当前版本 $localVer）：\n" + result.errors.joinToString("\n")
+                            return@launch
                         }
+                        if (!UpdateChecker.hasNew(remote, localVer)) {
+                            updateMsg = "已是最新版本 $localVer（仓库最新 ${remote.tag}，来源：${remote.source}）"
+                            return@launch
+                        }
+                        // 发现新版本：先询问用户
+                        pendingUpdate = remote
+                        showUpdateDialog = true
+                        updateMsg = "发现新版本 ${remote.tag}，等待确认…"
                     }
                 }
-            ) { Text(if (progress in 0..100) "下载中 $progress%" else "检测更新") }
-            Text("更新源：GitHub 仓库 sml1145/jianpan 的最新发布版本", fontSize = 11.sp, color = Color(0xFF8A6B7A))
+            ) {
+                Text(
+                    when {
+                        downloading && progress in 0..100 -> "正在更新 $progress%"
+                        downloading -> "准备下载…"
+                        checking -> "检测中…"
+                        else -> "检测更新"
+                    }
+                )
+            }
+            // 下载进度条
+            if (downloading) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { (progress.coerceIn(0, 100)) / 100f },
+                    modifier = Modifier.fillMaxWidth().height(10.dp),
+                    color = Color(0xFFB23A8F),
+                    trackColor = Color(0xFFE5C9D8)
+                )
+                Text(
+                    if (progress in 0..100) "正在更新到 ${pendingUpdate?.tag ?: "新版本"}（$progress%），请勿退出页面"
+                    else "正在连接更新源…",
+                    fontSize = 12.sp, color = Color(0xFF6B5670),
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+            Text("更新源：GitHub 仓库 sml1145/jianpan 最新发布（四通道自动容错：API / 网页 / Atom / CDN）",
+                fontSize = 11.sp, color = Color(0xFF8A6B7A))
 
             Spacer(Modifier.height(10.dp))
             Section("桌面小组件")
             Text("在桌面添加「梦婷打字统计」组件，可查看今日码字与情绪占比；数据每天凌晨 5 点刷新。", fontSize = 12.sp, color = Color(0xFF6B5670))
 
             Spacer(Modifier.height(24.dp))
+        }
+
+        // 发现新版本确认弹窗
+        if (showUpdateDialog) {
+            val remote = pendingUpdate
+            AlertDialog(
+                onDismissRequest = { showUpdateDialog = false; pendingUpdate = null },
+                title = { Text("发现新版本", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("当前版本：$localVer")
+                        Text("最新版本：${remote?.tag ?: ""}")
+                        if (!remote?.notes.isNullOrBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            Text("更新说明：", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(remote?.notes ?: "", fontSize = 13.sp, color = Color(0xFF6B5670))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { remote?.let { startDownload(it) } }) {
+                        Text("立即更新", color = Color(0xFFB23A8F), fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showUpdateDialog = false
+                        pendingUpdate = null
+                        updateMsg = "已取消更新（最新版本 ${remote?.tag}）"
+                    }) { Text("稍后再说") }
+                }
+            )
         }
     }
 
