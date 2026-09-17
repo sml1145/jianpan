@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">梦婷输入法</string>
+    <string name="ime_name">梦婷输入法</string>
+    <string name="setup_title">启用梦婷输入法</string>
+    <string name="setup_step1">1. 在系统输入法列表中启用「梦婷输入法」</string>
+    <string name="setup_step2">2. 将「梦婷输入法」切换为当前默认输入法</string>
+    <string name="btn_enable_ime">去启用输入法</string>
+    <string name="btn_set_default">设为默认输入法</string>
+    <string name="btn_enter_settings">进入设置中心</string>
+    <string name="widget_label">梦婷打字统计</string>
+</resources>
