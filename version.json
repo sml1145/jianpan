@@ -1,7 +1,7 @@
 ﻿{
-    "version":  "v1.0.3",
-    "versionCode":  3,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.3/mengting-ime-v1.0.3.apk",
-    "sha256":  "83cdcf4514fa4ca0d73f1abb86c4f5e7372fa9145c80fbba30959c94a4adcde3",
-    "notes":  "检测更新多通道容错；按键颜色扩充至18色；开屏动画连贯化。"
+    "version":  "v1.0.4",
+    "versionCode":  4,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.4/mengting-ime-v1.0.4.apk",
+    "sha256":  "03b34b94c8a3a956b7cd0472de6c1559047e77bb1b9f16afd2c1f955fddb9525",
+    "notes":  "Fix: crash (flash-back) when opening the app (rewrote the splash animation with a fixed node tree)."
 }
