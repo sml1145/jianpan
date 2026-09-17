@@ -148,7 +148,8 @@ class SetupActivity : ComponentActivity() {
                     updateMsg = "下载完成并通过校验，正在拉起安装 ${remote.tag}"
                     UpdateChecker.install(ctx, f)
                 } else {
-                    updateMsg = "下载失败：请检查网络后重试"
+                    val reason = UpdateChecker.lastDownloadError ?: "未知错误"
+                    updateMsg = "下载失败：$reason（可重试，已支持断点续传）"
                 }
             }
         }

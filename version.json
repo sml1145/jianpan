@@ -1,7 +1,7 @@
 ﻿{
-  "version": "v1.0.3",
-  "versionCode": 3,
-  "apkUrl": "https://github.com/sml1145/jianpan/releases/download/v1.0.3/mengting-ime-v1.0.3.apk",
-  "sha256": "db9d4e1c859d5c1fb0da44dbf08c23af967b971f49f8e6577877b70eaa2b4e03",
-  "notes": "检测更新多通道容错；按键颜色扩充至18色；开屏动画连贯化。"
+    "version":  "v1.0.3",
+    "versionCode":  3,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.3/mengting-ime-v1.0.3.apk",
+    "sha256":  "83cdcf4514fa4ca0d73f1abb86c4f5e7372fa9145c80fbba30959c94a4adcde3",
+    "notes":  "检测更新多通道容错；按键颜色扩充至18色；开屏动画连贯化。"
 }

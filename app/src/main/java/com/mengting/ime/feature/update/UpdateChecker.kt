@@ -195,83 +195,106 @@ object UpdateChecker {
         CheckResult(null, errors)
     }
 
-    // ---------------- 下载（断点续传 + 校验） ----------------
+    // ---------------- 下载（断点续传 + 校验 + 失败重试） ----------------
 
     class UpdateException(msg: String) : Exception(msg)
+
+    /** 最近一次下载失败原因，供界面展示诊断 */
+    @Volatile var lastDownloadError: String? = null
+        private set
 
     suspend fun download(
         ctx: Context, url: String, sha256: String?,
         onProgress: (Int) -> Unit
     ): File? = withContext(Dispatchers.IO) {
+        lastDownloadError = null
+        var attempt = 0
+        while (attempt < 2) {
+            attempt++
+            try {
+                val f = downloadOnce(ctx, url, sha256, onProgress)
+                if (f != null) return@withContext f
+            } catch (e: Exception) {
+                lastDownloadError = e.message ?: e.javaClass.simpleName
+                android.util.Log.e("MTUpdate", "download attempt $attempt failed", e)
+            }
+            if (attempt < 2) delay(1200)
+        }
+        null
+    }
+
+    private fun downloadOnce(
+        ctx: Context, url: String, sha256: String?,
+        onProgress: (Int) -> Unit
+    ): File? {
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
         val out = File(dir, "update.apk")
         val part = File(dir, "update.apk.part")
-        try {
-            var resumeFrom = if (part.exists()) part.length() else 0L
-            var conn = open(url)
-            conn.setRequestProperty("Range", "bytes=$resumeFrom-")
-            var code = conn.responseCode
-            if (code == 416) { // 续传位置越界，重来
-                part.delete(); resumeFrom = 0
-                conn.disconnect()
-                conn = open(url)
-                code = conn.responseCode
-            }
-            if (code == 206) {
-                // 服务端支持续传
-            } else if (code in 200..299) {
-                part.delete(); resumeFrom = 0
-            } else {
-                conn.disconnect()
-                throw UpdateException("下载 HTTP $code")
-            }
-            val total = conn.contentLengthLong.let { if (it > 0) it + resumeFrom else -1L }
-            conn.inputStream.use { input ->
-                RandomAccessFile(part, "rw").use { raf ->
-                    raf.seek(resumeFrom)
-                    val buf = ByteArray(64 * 1024)
-                    var done = resumeFrom
-                    var n: Int
-                    var lastReport = -1
-                    while (input.read(buf).also { n = it } != -1) {
-                        raf.write(buf, 0, n)
-                        done += n
-                        if (total > 0) {
-                            val p = ((done * 100) / total).toInt()
-                            if (p != lastReport && p % 2 == 0) { lastReport = p; onProgress(p) }
-                        }
+        var resumeFrom = if (part.exists()) part.length() else 0L
+        var conn = open(url, timeoutMs = 20000)
+        conn.readTimeout = 30000
+        conn.setRequestProperty("Range", "bytes=$resumeFrom-")
+        var code = conn.responseCode
+        if (code == 416) { // 续传位置越界，重来
+            part.delete(); resumeFrom = 0
+            conn.disconnect()
+            conn = open(url, timeoutMs = 20000)
+            conn.readTimeout = 30000
+            code = conn.responseCode
+        }
+        if (code == 206) {
+            // 服务端支持续传
+        } else if (code in 200..299) {
+            if (resumeFrom > 0) { part.delete(); resumeFrom = 0 }
+        } else {
+            conn.disconnect()
+            throw UpdateException("下载请求失败 HTTP $code")
+        }
+        val reported = conn.contentLengthLong
+        val total = if (reported > 0) reported + resumeFrom else -1L
+        conn.inputStream.use { input ->
+            RandomAccessFile(part, "rw").use { raf ->
+                raf.seek(resumeFrom)
+                val buf = ByteArray(64 * 1024)
+                var done = resumeFrom
+                var n: Int
+                var lastReport = -1
+                while (input.read(buf).also { n = it } != -1) {
+                    raf.write(buf, 0, n)
+                    done += n
+                    if (total > 0) {
+                        val p = ((done * 100) / total).toInt()
+                        if (p != lastReport && p % 2 == 0) { lastReport = p; onProgress(p) }
                     }
                 }
             }
-            conn.disconnect()
-            // 校验 1：大小合理（本项目 APK > 100MB）
-            if (part.length() < 10L * 1024 * 1024) {
-                part.delete()
-                throw UpdateException("下载文件过小，可能不完整")
-            }
-            // 校验 2：APK 魔数 PK
-            RandomAccessFile(part, "r").use { raf ->
-                val head = ByteArray(2); raf.readFully(head)
-                if (!(head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte())) {
-                    part.delete()
-                    throw UpdateException("文件不是有效的 APK")
-                }
-            }
-            // 校验 3：SHA256（若发布方提供）
-            if (!sha256.isNullOrBlank()) {
-                val actual = sha256Of(part)
-                if (!actual.equals(sha256, ignoreCase = true)) {
-                    part.delete()
-                    throw UpdateException("SHA256 校验失败")
-                }
-            }
-            if (out.exists()) out.delete()
-            if (!part.renameTo(out)) throw UpdateException("无法保存安装包")
-            onProgress(100)
-            out
-        } catch (e: Exception) {
-            null
         }
+        conn.disconnect()
+        // 校验 1：大小合理（本项目 APK > 100MB）
+        if (part.length() < 10L * 1024 * 1024) {
+            part.delete()
+            throw UpdateException("下载文件过小（${part.length()} 字节），可能不完整")
+        }
+        // 校验 2：APK 魔数 PK
+        RandomAccessFile(part, "r").use { raf ->
+            val head = ByteArray(2); raf.readFully(head)
+            if (!(head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte())) {
+                part.delete()
+                throw UpdateException("文件不是有效的 APK")
+            }
+        }
+        // 校验 3：SHA256（若发布方提供）
+        if (!sha256.isNullOrBlank()) {
+            val actual = sha256Of(part)
+            if (!actual.equals(sha256, ignoreCase = true)) {
+                part.delete()
+                throw UpdateException("SHA256 校验失败")
+            }
+        }
+        if (out.exists()) out.delete()
+        if (!part.renameTo(out)) throw UpdateException("无法保存安装包")
+        onProgress(100)
+        return out
     }
 
     private fun sha256Of(f: File): String {
