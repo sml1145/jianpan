@@ -1,7 +1,8 @@
 ﻿{
-    "version":  "v1.0.8",
-    "versionCode":  8,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.8/mengting-ime-v1.0.8.apk",
-    "sha256":  "e8961686493c7272d7da4a4d64e542ea9528c4d4b343f6bb416dd40f5b194bbe",
-    "notes":  "修复更新下载（多通道自动回退+空间预检+独立下载协程）、中文候选同步加载首批3万词、语音模型外置安装后镜像下载、包体瘦身至82MB（移除OCR残留与x86库）。"
+    "version":  "v1.0.9",
+    "versionCode":  9,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.9/mengting-ime-v1.0.9.apk",
+    "sha256":  "49f201199e167ec994c624782ea664f85507f7466c52de0fdc1ebed18dfc65af",
+    "notes":  "中文候选增强：前缀/简拼/整句全覆盖（输s出是、输sc出生成），联网增强真实化（CDN热词表），组件一键添加挂系统回调，更新下载通道探测选优+大小校验+浏览器兜底。",
+    "apkSize":  85995398
 }

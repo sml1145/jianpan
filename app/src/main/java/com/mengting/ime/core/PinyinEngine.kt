@@ -3,11 +3,13 @@ package com.mengting.ime.core
 import android.content.Context
 
 /**
- * 拼音引擎（分级加载版）：
- *  - 阶段1：字音表+字频（<1秒），单字候选立即可用
- *  - 阶段2：先建高频前 5 万词索引并原子切换，词候选尽快可用
- *  - 阶段3：后台补全至 30 万词，再次原子切换
- * 所有索引以不可变快照发布，读取无锁。
+ * 拼音引擎（分级加载 + 三层索引版）：
+ *  - 字音表+字频 同步秒载；首批 3 万高频词同步加载（键盘弹出即有候选）
+ *  - 索引1：全拼精确/切分（原有）
+ *  - 索引2：音节前缀 → 单字（输入 s 即出 是/说/三…）
+ *  - 索引3：简拼首字母 → 词（输入 sc 即出 生成/所以/市场…；DP 处理 xian→x/xa 歧义）
+ *  - 索引4：拼音键有序数组 + 二分前缀检索（输入 sheng 出 生成/生活…）
+ *  - 云端热词覆盖层（HotWordStore 合并，联网增强真实生效）
  */
 object PinyinEngine {
     @Volatile var charsReady = false
@@ -17,33 +19,34 @@ object PinyinEngine {
     @Volatile var ready = false
         private set
 
-    /** 字 -> 拼音（无声调，多音） */
     private val charPinyins = HashMap<Char, Array<String>>(30000)
-
-    /** 拼音 -> 单字（按字频排序） */
     private val pyChars = HashMap<String, ArrayList<Char>>(500)
-
-    /** 字频 */
     private val charFreq = HashMap<Char, Int>(20000)
 
-    /** 词索引快照（不可变，原子替换） */
     class WordIndex(
         val words: Array<String>,
         val freqs: IntArray,
-        val byPy: Map<String, IntArray>
+        val byPy: Map<String, IntArray>,
+        /** 键有序数组与对应词下标（二分前缀检索） */
+        val keysSorted: Array<String>,
+        val idxSorted: IntArray,
+        /** 简拼首字母 → 词下标 */
+        val byInitials: Map<String, IntArray>
     )
 
     @Volatile private var index: WordIndex? = null
 
-    /** 词库发布版本流：界面订阅后在索引就绪时补刷候选 */
     private val _indexVersion = kotlinx.coroutines.flow.MutableStateFlow(0)
     val indexVersionFlow: kotlinx.coroutines.flow.StateFlow<Int> = _indexVersion
 
-    /** 合法音节集合（用于九宫格展开剪枝） */
     private val syllables = HashSet<String>(500)
-
-    /** 用户词典：词 -> 加分 */
     private val userBoost = HashMap<String, Int>()
+
+    /** 云端热词覆盖层：全拼键 → 词 */
+    private val hotByKey = HashMap<String, ArrayList<String>>()
+
+    /** 云端热词覆盖层：简拼 → 词 */
+    private val hotByInitials = HashMap<String, ArrayList<String>>()
 
     private const val STAGE1_WORDS = 30000
     private const val MAX_WORDS = 250000
@@ -57,16 +60,12 @@ object PinyinEngine {
                 charsReady = true
                 ready = true
             } catch (e: Throwable) {
-                // 加载失败不置 ready，下次调用会重试；记录日志便于诊断
                 android.util.Log.e("MTDict", "loadChars failed", e)
             }
-            // 首批高频词同步加载（约 0.7MB，百毫秒级），保证键盘弹出即有词候选
             if (ready && !wordsReady) {
                 try {
                     val loaded = loadWordsSync(ctx, STAGE1_WORDS)
-                    if (loaded > 0) {
-                        android.util.Log.i("MTDict", "stage1 sync loaded $loaded words")
-                    }
+                    if (loaded > 0) android.util.Log.i("MTDict", "stage1 sync loaded $loaded words")
                 } catch (e: Throwable) {
                     android.util.Log.e("MTDict", "stage1 sync failed", e)
                 }
@@ -82,7 +81,6 @@ object PinyinEngine {
 
     @Volatile private var wordsLoading = false
 
-    /** 同步读取前 limit 条词并发布；返回已加载条数 */
     private fun loadWordsSync(ctx: Context, limit: Int): Int {
         val words = ArrayList<String>(limit)
         val freqs = ArrayList<Int>(limit)
@@ -132,39 +130,42 @@ object PinyinEngine {
     }
 
     private fun loadWordsStaged(ctx: Context) {
+        val cur = index
+        // 从已有快照继续补齐（stage1 已含前 3 万）
         val words = ArrayList<String>(MAX_WORDS)
         val freqs = ArrayList<Int>(MAX_WORDS)
         val byPy = HashMap<String, ArrayList<Int>>(MAX_WORDS)
-        var publishedStage1 = false
-        var count = 0
+        if (cur != null) {
+            for (i in cur.words.indices) {
+                words.add(cur.words[i]); freqs.add(cur.freqs[i])
+            }
+            for ((k, arr) in cur.byPy) byPy[k] = arr.toCollection(ArrayList())
+        }
+        var count = words.size
         try {
             ctx.assets.open("dict/word_freq_py.txt").bufferedReader().useLines { lines ->
+                var lineNo = 0
                 for (ln in lines) {
+                    lineNo++
                     if (count >= MAX_WORDS) break
+                    if (lineNo <= STAGE1_WORDS) continue // 已在 stage1
                     val p = ln.split('\t')
                     if (p.size < 3) continue
-                    val key = p[0]
-                    val w = p[1]
-                    val fr = p[2].toIntOrNull() ?: continue
                     val idx = words.size
-                    words.add(w); freqs.add(fr)
-                    byPy.getOrPut(key) { ArrayList() }.add(idx)
+                    words.add(p[1])
+                    freqs.add(p[2].toIntOrNull() ?: 0)
+                    byPy.getOrPut(p[0]) { ArrayList() }.add(idx)
                     count++
-                    // 阶段1：前 3 万高频词先发布
-                    if (!publishedStage1 && count >= STAGE1_WORDS) {
-                        publish(words, freqs, byPy)
-                        publishedStage1 = true
-                        wordsReady = true
-                    }
                 }
             }
         } catch (e: Exception) {
-            android.util.Log.e("MTDict", "load failed", e)
+            android.util.Log.e("MTDict", "staged load failed", e)
         }
-        if (words.isNotEmpty()) {
+        if (words.size > (cur?.words?.size ?: 0)) {
             publish(words, freqs, byPy)
-            wordsReady = true
+            android.util.Log.i("MTDict", "full dict loaded: ${words.size} words")
         }
+        wordsReady = true
     }
 
     private fun publish(
@@ -174,23 +175,75 @@ object PinyinEngine {
         val fArr = freqs.toIntArray()
         val mMap = HashMap<String, IntArray>(byPy.size)
         for ((k, v) in byPy) mMap[k] = v.toIntArray()
-        index = WordIndex(wArr, fArr, mMap)
+
+        // 有序键数组（二分前缀检索）
+        val entries = ArrayList<Pair<String, Int>>(wArr.size)
+        for ((k, arr) in byPy) for (i in arr) entries.add(k to i)
+        entries.sortWith(compareBy({ it.first }, { -fArr[it.second] }))
+        val keysSorted = Array(entries.size) { entries[it].first }
+        val idxSorted = IntArray(entries.size) { entries[it].second }
+
+        // 简拼首字母索引
+        val initMap = HashMap<String, ArrayList<Int>>()
+        for ((k, arr) in byPy) {
+            for (init in initialsVariants(k)) {
+                if (init.length < 2) continue
+                initMap.getOrPut(init) { ArrayList() }.addAll(arr.toList())
+            }
+        }
+        val initFinal = HashMap<String, IntArray>(initMap.size)
+        for ((k, v) in initMap) {
+            val sorted = v.sortedByDescending { fArr[it] }
+            initFinal[k] = sorted.take(40).toIntArray()
+        }
+
+        index = WordIndex(wArr, fArr, mMap, keysSorted, idxSorted, initFinal)
         _indexVersion.value = _indexVersion.value + 1
     }
 
-    /** 词的拼音串联（每字取首读音），含未知字返回 null */
-    private fun pinyinOf(word: String): String? {
-        val sb = StringBuilder()
-        for (ch in word) {
-            val pys = charPinyins[ch] ?: return null
-            sb.append(pys[0])
+    /** 拼音键 → 所有可能的首字母串（DP 处理 xian→x/xa 类歧义，最多 4 组） */
+    private fun initialsVariants(key: String): List<String> {
+        val results = LinkedHashSet<String>()
+        fun dfs(pos: Int, cur: StringBuilder) {
+            if (results.size >= 4) return
+            if (pos == key.length) { results.add(cur.toString()); return }
+            for (len in 6 downTo 1) {
+                if (pos + len > key.length) continue
+                val s = key.substring(pos, pos + len)
+                if (syllables.contains(s)) {
+                    cur.append(s[0])
+                    dfs(pos + len, cur)
+                    cur.deleteCharAt(cur.length - 1)
+                }
+            }
         }
-        return sb.toString()
+        dfs(0, StringBuilder())
+        return results.toList()
     }
 
     fun addUserWord(word: String) {
         userBoost[word] = (userBoost[word] ?: 0) + 100
     }
+
+    /** 云端热词合并（HotWordStore 调用） */
+    fun addHotWords(entries: List<Triple<String, String, Int>>) {
+        synchronized(hotByKey) {
+            for ((key, word, boost) in entries) {
+                if (key.isEmpty() || word.isEmpty()) continue
+                hotByKey.getOrPut(key) { ArrayList() }.let { l ->
+                    if (!l.contains(word)) l.add(word)
+                }
+                for (init in initialsVariants(key)) {
+                    if (init.length < 2) continue
+                    hotByInitials.getOrPut(init) { ArrayList() }.let { l ->
+                        if (!l.contains(word)) l.add(word)
+                    }
+                }
+            }
+        }
+    }
+
+    fun hotWordCount(): Int = synchronized(hotByKey) { hotByKey.size }
 
     private fun fuzzyVariants(input: String): List<String> {
         val set = LinkedHashSet<String>()
@@ -209,28 +262,96 @@ object PinyinEngine {
         return set.toList().take(12)
     }
 
-    /** 全拼输入串 -> 候选词列表 */
+    /** 全拼输入串 -> 候选词列表（前缀/简拼/整句全覆盖） */
     fun candidates(input: String, limit: Int = 30): List<String> {
         if (input.isEmpty() || !charsReady) return emptyList()
+        if (input.any { !it.isLetter() }) return emptyList()
         val out = LinkedHashSet<String>()
-        // 1) 整串为单音节：单字候选
+
+        // 0) 云端热词（联网增强）：精确键 → 简拼
+        synchronized(hotByKey) {
+            hotByKey[input]?.let { out.addAll(it) }
+            if (input.length >= 2) hotByInitials[input]?.let { out.addAll(it) }
+        }
+
+        val idx = index
+        if (input.length <= 2) {
+            // 短输入：简拼词优先，其次单字（精确音节 → 前缀音节）
+            if (idx != null && input.length == 2) {
+                idx.byInitials[input]?.let { arr ->
+                    for (i in arr) if (out.size < limit) out.add(idx.words[i])
+                }
+            }
+            addCharsFor(out, input, limit)
+            // 前缀词（如 "sa" 前缀的词）
+            if (idx != null) addPrefixWords(idx, out, input, limit, 6)
+        } else {
+            // 长输入：整句切分 → 前缀词 → 简拼词 → 单字
+            if (idx != null) {
+                for (w in segmentTop(input, idx, 4)) if (out.size < limit) out.add(w)
+                addPrefixWords(idx, out, input, limit, 10)
+                idx.byInitials[input]?.let { arr ->
+                    for (i in arr.take(6)) if (out.size < limit) out.add(idx.words[i])
+                }
+            } else {
+                for (w in fallbackSplit(input)) if (out.size < limit) out.add(w)
+            }
+            addCharsFor(out, input, limit)
+        }
+        return out.toList().take(limit)
+    }
+
+    /** 单字候选：精确音节优先，其次前缀音节（按字频排序） */
+    private fun addCharsFor(out: LinkedHashSet<String>, input: String, limit: Int) {
         for (v in fuzzyVariants(input)) {
             pyChars[v]?.let { chars ->
                 for (c in chars) if (out.size < limit) out.add(c.toString())
             }
         }
-        val idx = index
-        // 2) 词库切分
-        if (idx != null) {
-            for (w in segmentTop(input, idx, 4)) if (out.size < limit) out.add(w)
-        } else {
-            // 3) 词库未就绪：音节切分 + 每音节最高频字拼串兜底
-            for (w in fallbackSplit(input)) if (out.size < limit) out.add(w)
+        if (out.size >= limit) return
+        // 前缀音节匹配（input 是音节前缀，如 s → sa/san/sha/…）
+        if (input.length <= 4) {
+            val merged = ArrayList<Char>()
+            for (syl in syllables) {
+                if (syl.length > input.length && syl.startsWith(input)) {
+                    pyChars[syl]?.let { merged.addAll(it.take(4)) }
+                }
+            }
+            val seen = HashSet<Char>()
+            merged.sortedByDescending { charFreq[it] ?: 0 }
+            for (c in merged) {
+                if (out.size >= limit) break
+                if (seen.add(c)) out.add(c.toString())
+            }
         }
-        return out.toList()
     }
 
-    /** 词库未就绪时的兜底：把输入串切成音节，各取最高频字 */
+    /** 前缀词检索：二分定位键区间，扫描并按词频取前 k */
+    private fun addPrefixWords(
+        idx: WordIndex, out: LinkedHashSet<String>, input: String, limit: Int, k: Int
+    ) {
+        val keys = idx.keysSorted
+        if (keys.isEmpty() || input.isEmpty()) return
+        var lo = 0; var hi = keys.size
+        while (lo < hi) {
+            val mid = (lo + hi) / 2
+            if (keys[mid] >= input) hi = mid else lo = mid + 1
+        }
+        if (lo >= keys.size || !keys[lo].startsWith(input)) return
+        val collected = ArrayList<Int>()
+        var i = lo
+        val cap = lo + 8000
+        while (i < keys.size && i < cap && keys[i].startsWith(input)) {
+            collected.add(idx.idxSorted[i])
+            i++
+        }
+        val sorted = collected.sortedByDescending { idx.freqs[it] }
+        for (wi in sorted.take(k)) {
+            if (out.size >= limit) break
+            out.add(idx.words[wi])
+        }
+    }
+
     private fun fallbackSplit(input: String): List<String> {
         val sylls = splitSyllables(input) ?: return emptyList()
         val sb = StringBuilder()
@@ -241,7 +362,6 @@ object PinyinEngine {
         return listOf(sb.toString())
     }
 
-    /** 贪心最长匹配切分音节 */
     private fun splitSyllables(input: String): List<String>? {
         val res = ArrayList<String>()
         var pos = 0
@@ -259,7 +379,6 @@ object PinyinEngine {
         return res
     }
 
-    /** 记忆化切分：返回 input 的 top-K 组合词串 */
     private fun segmentTop(input: String, idx: WordIndex, k: Int): List<String> {
         val memo = HashMap<Int, List<Pair<String, Long>>>()
         fun dfs(pos: Int): List<Pair<String, Long>> {
@@ -286,7 +405,6 @@ object PinyinEngine {
                 }
                 if (res.size > 400) break
             }
-            // 单字路径
             for (v in fuzzyVariants(input.substring(pos, minOf(input.length, pos + 7)))) {
                 val chars = pyChars[v] ?: continue
                 val c = chars.firstOrNull() ?: continue
@@ -303,7 +421,6 @@ object PinyinEngine {
         return dfs(0).map { it.first }
     }
 
-    /** 九宫格：数字串 -> 候选 */
     fun candidatesT9(digits: String, limit: Int = 30): List<String> {
         val pinyins = expandT9(digits)
         val out = LinkedHashSet<String>()

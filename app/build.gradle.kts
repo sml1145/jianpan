@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
@@ -11,21 +11,18 @@ android {
         applicationId = "com.mengting.ime"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.0.8"
-        // 真机只需 arm 双架构；模拟器自检走 debug 构建（不受此过滤影响需单独配置见下）
+        versionCode = 9
+        versionName = "1.0.9"
+        // Real devices only need arm dual architectures; emulator self-check uses debug builds with x86_64
         ndk.abiFilters += listOf("arm64-v8a", "armeabi-v7a")
     }
 
-    // debug 构建保留 x86_64 供模拟器自检
     buildTypes {
         debug {
+            // keep x86_64 for emulator self-check
             ndk.abiFilters.clear()
             ndk.abiFilters += listOf("x86_64", "arm64-v8a")
         }
-    }
-
-    buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -67,3 +64,5 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }
+
+

@@ -6,6 +6,8 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -40,7 +42,9 @@ object UpdateChecker {
         val apkUrl: String?,
         val notes: String,
         val sha256: String? = null,
-        val source: String = ""
+        val source: String = "",
+        /** 期望安装包字节数（发布元数据提供，用于完整性校验），0 表示未知 */
+        val apkSize: Long = 0L
     )
 
     data class CheckResult(
@@ -108,15 +112,20 @@ object UpdateChecker {
         val tag = obj.optString("tag_name")
         if (tag.isBlank()) throw UpdateException("API 通道：无 tag_name")
         var apkUrl: String? = null
+        var apkSize = 0L
         val assets = obj.optJSONArray("assets")
         if (assets != null) {
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
                 val name = a.optString("name")
-                if (name.endsWith(".apk")) { apkUrl = a.optString("browser_download_url"); break }
+                if (name.endsWith(".apk")) {
+                    apkUrl = a.optString("browser_download_url")
+                    apkSize = a.optLong("size", 0L)
+                    break
+                }
             }
         }
-        return Remote(tag, apkUrl, obj.optString("body"), source = "GitHub API")
+        return Remote(tag, apkUrl, obj.optString("body"), source = "GitHub API", apkSize = apkSize)
     }
 
     // ---------------- 通道 2：网页 302 跳转 ----------------
@@ -162,7 +171,8 @@ object UpdateChecker {
             obj.optString("apkUrl").ifBlank { guessApkUrl(tag) },
             obj.optString("notes"),
             validSha,
-            source = "jsdelivr CDN"
+            source = "jsdelivr CDN",
+            apkSize = obj.optLong("apkSize", 0L)
         )
     }
 
@@ -224,13 +234,60 @@ object UpdateChecker {
         }
     }
 
-    /** 下载通道：直连 + 国内加速镜像，按序回退 */
+    /** 下载通道：直连 + 国内加速镜像（按实测可用性排序），下载前还会探测选优 */
     private fun candidateUrls(url: String): List<String> = listOf(
-        url,
         "https://gh-proxy.com/$url",
+        url,
         "https://mirror.ghproxy.com/$url",
-        "https://ghproxy.net/$url"
+        "https://ghproxy.net/$url",
+        "https://gh.llkk.cc/$url",
+        "https://github.moeyy.xyz/$url"
     )
+
+    /**
+     * 通道探测：并发用 Range 小请求验证每个通道（状态码 + PK 魔数 + 总大小匹配），
+     * 把可用通道排前，避免在坏通道上浪费整次下载。
+     */
+    private suspend fun probeChannels(url: String, expectSize: Long): List<String> {
+        val all = candidateUrls(url)
+        val results = kotlinx.coroutines.coroutineScope {
+            all.map { u ->
+                async {
+                    val ok = try {
+                        val conn = open(u, timeoutMs = 8000)
+                        conn.setRequestProperty("Range", "bytes=0-1023")
+                        val code = conn.responseCode
+                        var magicOk = false
+                        if (code == 200 || code == 206) {
+                            val head = ByteArray(2)
+                            conn.inputStream.use { it.read(head) }
+                            magicOk = head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte()
+                        }
+                        // 期望大小匹配（Content-Range: bytes 0-1023/86000000）
+                        var sizeOk = expectSize <= 0L
+                        val cr = conn.getHeaderField("Content-Range")
+                        if (cr != null && cr.contains("/")) {
+                            val total = cr.substringAfterLast("/").trim().toLongOrNull() ?: 0L
+                            if (expectSize > 0 && total > 0) sizeOk = (total == expectSize)
+                        } else if (code == 200) {
+                            val len = conn.contentLengthLong
+                            if (expectSize > 0 && len > 0) sizeOk = (len == expectSize)
+                        }
+                        conn.disconnect()
+                        (code == 200 || code == 206) && magicOk && sizeOk
+                    } catch (e: Exception) {
+                        android.util.Log.w("MTUpdate", "probe failed $u: ${e.message}")
+                        false
+                    }
+                    u to ok
+                }
+            }.awaitAll()
+        }
+        val good = results.filter { it.second }.map { it.first }
+        val bad = results.filter { !it.second }.map { it.first }
+        android.util.Log.i("MTUpdate", "probe: good=${good.size}/${all.size}")
+        return good + bad // 可用通道在前，其余保留兜底
+    }
 
     suspend fun download(
         ctx: Context, remote: Remote,
@@ -242,35 +299,38 @@ object UpdateChecker {
             lastDownloadError = "发布页没有安装包附件"
             return@withContext null
         }
-        // 空间预检：需要约 2 倍安装包大小（part + 成品）
+        // 空间预检：期望大小 + 60MB 余量
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
         val free = try { android.os.StatFs(dir.absolutePath).availableBytes } catch (e: Exception) { -1L }
-        val needMin = 60L * 1024 * 1024 // 外置模型后包体约 20MB，预留 60MB 足够
+        val needMin = (if (remote.apkSize > 0) remote.apkSize * 2 else 60L * 1024 * 1024) + 20L * 1024 * 1024
         if (free in 0 until needMin) {
-            lastDownloadError = "手机存储空间不足（可用 ${free / 1048576}MB，需至少 ${needMin / 1048576}MB）"
+            lastDownloadError = "手机存储空间不足（可用 ${free / 1048576}MB，需约 ${needMin / 1048576}MB）"
             return@withContext null
         }
-        val urls = candidateUrls(url)
+        // 探测选优后按序尝试
+        val urls = try { probeChannels(url, remote.apkSize) } catch (e: Exception) { candidateUrls(url) }
         var lastErr: String? = null
         for ((i, u) in urls.withIndex()) {
             var attempt = 0
             while (attempt < 2) {
                 attempt++
                 try {
-                    val f = downloadOnce(ctx, u, remote.sha256, onProgress)
+                    val f = downloadOnce(ctx, u, remote.sha256, remote.apkSize, onProgress)
                     if (f != null) return@withContext f
                 } catch (e: Exception) {
                     lastErr = "通道${i + 1}第${attempt}次：${e.message ?: e.javaClass.simpleName}"
                     android.util.Log.e("MTUpdate", "download $u attempt $attempt failed", e)
                 }
             }
+            // 换通道前把进度归零提示（part 保留，同通道续传仍有效）
+            onProgress(0)
         }
         lastDownloadError = lastErr ?: "未知错误"
         null
     }
 
     private fun downloadOnce(
-        ctx: Context, url: String, sha256: String?,
+        ctx: Context, url: String, sha256: String?, expectSize: Long,
         onProgress: (Int) -> Unit
     ): File? {
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
@@ -316,10 +376,14 @@ object UpdateChecker {
             }
         }
         conn.disconnect()
-        // 校验 1：大小合理（外置模型后包体约 20MB，下限 3MB 防半截文件）
+        // 校验 1：大小合理（下限 3MB 防半截文件；有期望大小时精确比对）
         if (part.length() < 3L * 1024 * 1024) {
             part.delete()
             throw UpdateException("下载文件过小（${part.length()} 字节），可能不完整")
+        }
+        if (expectSize > 0 && part.length() != expectSize) {
+            part.delete()
+            throw UpdateException("文件大小不符（得到 ${part.length()}，期望 $expectSize），已丢弃可重试")
         }
         // 校验 2：APK 魔数 PK
         RandomAccessFile(part, "r").use { raf ->
@@ -354,6 +418,15 @@ object UpdateChecker {
     }
 
     // ---------------- 安装 ----------------
+
+    /** 兜底：用系统浏览器打开发布页，让用户手动下载 APK */
+    fun openInBrowser(ctx: Context) {
+        try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/$OWNER/$REPO/releases/latest"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(i)
+        } catch (_: Exception) {}
+    }
 
     fun canInstallUnknown(ctx: Context): Boolean =
         Build.VERSION.SDK_INT < 26 || ctx.packageManager.canRequestPackageInstalls()

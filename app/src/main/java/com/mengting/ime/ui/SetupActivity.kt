@@ -57,6 +57,7 @@ import com.mengting.ime.BuildConfig
 import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.feature.update.UpdateChecker
 import com.mengting.ime.widget.TypingStatsWidget
+import com.mengting.ime.widget.WidgetPinCallback
 import kotlinx.coroutines.launch
 
 /** 首次引导 + 设置中心（主页 + 两个副页，系统返回键先回主页） */
@@ -127,27 +128,51 @@ class SetupActivity : ComponentActivity() {
         }
     }
 
-    /** 一键添加桌面小组件 */
+    /** 一键添加桌面小组件：系统确认弹窗 + 结果回调；不支持时直接跳系统小组件选择页 */
     private fun pinWidget() {
         if (Build.VERSION.SDK_INT >= 26) {
             try {
                 val mgr = AppWidgetManager.getInstance(this)
                 val provider = ComponentName(this, TypingStatsWidget::class.java)
                 if (mgr.isRequestPinAppWidgetSupported) {
-                    val ok = mgr.requestPinAppWidget(provider, null, null)
-                    Toast.makeText(this,
-                        if (ok) "已发起添加，请在桌面弹出的确认框中点「添加」"
-                        else "当前桌面不支持自动添加，请手动添加",
-                        Toast.LENGTH_LONG).show()
+                    // 回调：系统确认结果通过广播送达
+                    val cb = android.app.PendingIntent.getBroadcast(
+                        this, 20260917,
+                        Intent(this, WidgetPinCallback::class.java),
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_MUTABLE
+                    )
+                    val ok = mgr.requestPinAppWidget(provider, null, cb)
+                    if (ok) {
+                        Toast.makeText(this, "已拉起系统确认框，请在其中点「添加」；若未弹出请看下方教程", Toast.LENGTH_LONG).show()
+                    } else {
+                        openWidgetChooser()
+                    }
                 } else {
-                    Toast.makeText(this, "当前桌面不支持自动添加，请手动添加", Toast.LENGTH_LONG).show()
+                    openWidgetChooser()
                 }
             } catch (e: Exception) {
-                Toast.makeText(this, "添加失败：${e.message?.take(50)}", Toast.LENGTH_LONG).show()
+                openWidgetChooser()
             }
         } else {
             Toast.makeText(this, "系统版本较低，请长按桌面手动添加「梦婷打字统计」组件", Toast.LENGTH_LONG).show()
         }
+    }
+
+    /** 直接跳转系统小组件选择页（真实系统 UI，非空壳） */
+    private fun openWidgetChooser() {
+        val tried = listOf(
+            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.Settings\$AppWidgetPickerActivity")),
+            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.AppWidgetPicker")),
+            Intent(Intent.ACTION_MAIN).addCategory("android.appwidget.category.WIDGET_PICKER")
+        )
+        for (i in tried) {
+            try {
+                startActivity(i)
+                Toast.makeText(this, "请在系统小组件列表中找到「梦婷打字统计」并添加", Toast.LENGTH_LONG).show()
+                return
+            } catch (_: Exception) {}
+        }
+        Toast.makeText(this, "当前桌面不支持自动添加，请长按桌面 → 小组件 → 梦婷打字统计", Toast.LENGTH_LONG).show()
     }
 
     @Composable
@@ -173,6 +198,7 @@ class SetupActivity : ComponentActivity() {
         var downloading by remember { mutableStateOf(false) }
         var pendingUpdate by remember { mutableStateOf<UpdateChecker.Remote?>(null) }
         var showUpdateDialog by remember { mutableStateOf(false) }
+        var showBrowserFallback by remember { mutableStateOf(false) }
         var showWidgetHelp by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
         val localVer = remember { UpdateChecker.localVersion(ctx) }
@@ -202,6 +228,7 @@ class SetupActivity : ComponentActivity() {
                         progress = -1
                         val reason = UpdateChecker.lastDownloadError ?: "未知错误"
                         updateMsg = "下载失败：$reason\n可稍后重试（支持断点续传，自动切换加速通道）"
+                        showBrowserFallback = true
                     }
                 }
             )
@@ -424,6 +451,21 @@ class SetupActivity : ComponentActivity() {
                                 fontSize = 12.sp, color = Color(0xFF6B5670),
                                 modifier = Modifier.padding(top = 4.dp)
                             )
+                        }
+                        if (showBrowserFallback) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+                                Button(
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8D6E63)),
+                                    onClick = { UpdateChecker.openInBrowser(ctx) }
+                                ) { Text("浏览器打开下载页", fontSize = 12.sp) }
+                                Button(
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD9B8C9)),
+                                    onClick = { showBrowserFallback = false }
+                                ) { Text("关闭", fontSize = 12.sp) }
+                            }
                         }
                         Text("更新源：GitHub 仓库 sml1145/jianpan 最新发布（四通道自动容错）",
                             fontSize = 11.sp, color = Color(0xFF8A6B7A))
