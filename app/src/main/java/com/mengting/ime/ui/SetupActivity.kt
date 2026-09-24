@@ -215,7 +215,7 @@ class SetupActivity : ComponentActivity() {
             pendingUpdate = null
             downloading = true
             progress = 0
-            updateMsg = "正在下载 ${remote.tag}（多通道自动切换）…"
+            updateMsg = "正在下载 ${remote.tag}（多连接并行加速）…"
             if (!UpdateChecker.canInstallUnknown(ctx)) {
                 downloading = false
                 updateMsg = "需要「安装未知应用」权限，授权后请重新检测更新"
@@ -235,7 +235,7 @@ class SetupActivity : ComponentActivity() {
                     } else {
                         progress = -1
                         val reason = UpdateChecker.lastDownloadError ?: "未知错误"
-                        updateMsg = "下载失败：$reason\n可稍后重试（支持断点续传，自动切换加速通道）"
+                        updateMsg = "下载失败：$reason\n可稍后重试（已下载进度会保留，支持断点续传）"
                         showBrowserFallback = true
                     }
                 }

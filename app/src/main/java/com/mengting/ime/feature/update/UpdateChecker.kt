@@ -24,14 +24,19 @@ import java.net.URL
 import java.security.MessageDigest
 
 /**
- * 应用内自更新（多源容错版）。
+ * 应用内自更新（并发测速 + 分片并行版）。
  * 更新源：GitHub 仓库 sml1145/jianpan（公开）。
- * 依次尝试 4 条通道，任一成功即返回：
- *   1. GitHub API  releases/latest          （权威，含附件直链）
- *   2. GitHub 网页 releases/latest 302 跳转  （不占 API 限额）
- *   3. Atom 订阅源 releases.atom             （取最新 entry 的 tag）
- *   4. jsdelivr CDN version.json             （国内网络友好）
- * 每通道失败自动重试一次；全部失败时返回每个通道的具体错误，便于诊断。
+ *
+ * 检测：4 条通道**并发竞速**，谁先返回用谁——
+ *   1. jsdelivr CDN version.json（国内可达性最好，且带 sha256 与大小）
+ *   2. GitHub API  releases/latest（权威，含附件直链）
+ *   3. GitHub 网页 releases/latest 302 跳转（不占 API 限额）
+ *   4. Atom 订阅源 releases.atom（取最新 entry 的 tag）
+ *
+ * 下载：先探测存活通道并**实测速度**排序（死通道直接出局），
+ * 再用同通道 **4 分片并行**下载（实测 gh-proxy 单连接约 69KB/s，4 连接约 430KB/s）；
+ * 分片失败只保留不删除进度、按分片续传重试，通道不支持 Range 时回退单连接续传。
+ * 「慢」不再触发换通道：慢只如实提示并继续下，只有完全停滞或校验失败才放弃。
  */
 object UpdateChecker {
     private const val OWNER = "sml1145"
@@ -300,26 +305,52 @@ object UpdateChecker {
         }
     }
 
-    /** 下载通道：直连 + 国内加速镜像（按实测可用性排序），下载前还会探测选优 */
-    private fun candidateUrls(url: String): List<String> = listOf(
-        "https://gh-proxy.com/$url",
-        url,
-        "https://mirror.ghproxy.com/$url",
-        "https://ghproxy.net/$url",
-        "https://gh.llkk.cc/$url",
-        "https://github.moeyy.xyz/$url"
-    )
+    /**
+     * 下载通道：直连 + 国内加速镜像。此处顺序只是初始偏好，实际按探测实测速度重排。
+     * 实测（2026-09）gh-proxy 与 cors.isteed.cc 可用，其余多数镜像已失效，
+     * 保留它们是作为将来网络环境变化时的兜底。
+     *
+     * 注意各镜像的 URL 拼接格式不同：多数是「前缀 + 完整 URL」，
+     * 而 isteed 实测要求「前缀 + 去掉 scheme 的路径」（github.com/...），
+     * 拼错会直接 404，所以这里分开构造，不能统一用 $url。
+     */
+    private fun candidateUrls(url: String): List<String> {
+        val bare = url.removePrefix("https://").removePrefix("http://")
+        return listOf(
+            "https://gh-proxy.com/$url",
+            "https://cors.isteed.cc/$bare",
+            url,
+            "https://mirror.ghproxy.com/$url",
+            "https://ghproxy.net/$url",
+            "https://gh.llkk.cc/$url",
+            "https://github.moeyy.xyz/$url"
+        )
+    }
 
     /**
-     * 通道探测：并发用 Range 小请求验证每个通道（状态码 + PK 魔数 + 总大小匹配），
-     * 把可用通道排前，避免在坏通道上浪费整次下载。
+     * 探测结果：通道地址 + 是否支持 Range（决定能否分片并行）+ 实测单连接速度 KB/s（0=未测）。
      */
-    private suspend fun probeChannels(url: String, expectSize: Long): List<String> {
+    private data class Channel(val url: String, val rangeOk: Boolean, val kbps: Long)
+
+    /**
+     * 通道探测：可用性 + Range 支持 + **实测速度**。
+     *
+     * 旧实现只验证「能不能连上」（状态码/PK 魔数/总大小），却对用户宣称会「切换到更快的通道」。
+     * 它从未测过速度，排序与快慢无关，于是慢了就盲目换通道——而实测六个通道里往往只有
+     * gh-proxy 活着，其余全部超时，换来换去只会把时间耗在死通道上直到下载失败。
+     *
+     * 现在分两步：
+     *   1) 并发用 1KB Range 请求筛掉死通道（代价极小，且不会触发镜像的并发限流）；
+     *   2) 存活通道多于一个时，再逐个用 192KB 样本实测单连接速度并降序排列。
+     *      只剩一个存活通道时直接跳过测速——国内常见情况就是只有 gh-proxy 可用，
+     *      此时测速纯属浪费时间。
+     */
+    private suspend fun probeChannels(url: String, expectSize: Long): List<Channel> {
         val all = candidateUrls(url)
-        val results = kotlinx.coroutines.coroutineScope {
+        val alive = coroutineScope {
             all.map { u ->
                 async {
-                    val ok = try {
+                    try {
                         val conn = open(u, timeoutMs = 8000)
                         conn.setRequestProperty("Range", "bytes=0-1023")
                         val code = conn.responseCode
@@ -329,7 +360,7 @@ object UpdateChecker {
                             conn.inputStream.use { it.read(head) }
                             magicOk = head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte()
                         }
-                        // 期望大小匹配（Content-Range: bytes 0-1023/86000000）
+                        // 期望大小匹配（Content-Range: bytes 0-1023/64877862）
                         var sizeOk = expectSize <= 0L
                         val cr = conn.getHeaderField("Content-Range")
                         if (cr != null && cr.contains("/")) {
@@ -340,19 +371,54 @@ object UpdateChecker {
                             if (expectSize > 0 && len > 0) sizeOk = (len == expectSize)
                         }
                         conn.disconnect()
-                        (code == 200 || code == 206) && magicOk && sizeOk
+                        if ((code == 200 || code == 206) && magicOk && sizeOk) {
+                            Channel(u, rangeOk = code == 206, kbps = 0)
+                        } else {
+                            android.util.Log.w("MTUpdate", "probe unusable $u: HTTP $code magic=$magicOk size=$sizeOk")
+                            null
+                        }
                     } catch (e: Exception) {
                         android.util.Log.w("MTUpdate", "probe failed $u: ${e.message}")
-                        false
+                        null
                     }
-                    u to ok
                 }
-            }.awaitAll()
+            }.awaitAll().filterNotNull()
         }
-        val good = results.filter { it.second }.map { it.first }
-        val bad = results.filter { !it.second }.map { it.first }
-        android.util.Log.i("MTUpdate", "probe: good=${good.size}/${all.size}")
-        return good + bad // 可用通道在前，其余保留兜底
+        android.util.Log.i("MTUpdate", "probe alive=${alive.size}/${all.size}")
+        if (alive.size <= 1) return alive
+        val measured = alive.map { ch -> ch.copy(kbps = measureSpeed(ch.url)) }
+        measured.forEach { android.util.Log.i("MTUpdate", "speed ${it.kbps}KB/s range=${it.rangeOk} ${it.url}") }
+        return measured.sortedByDescending { it.kbps }
+    }
+
+    /** 测速样本大小：192KB，够测出稳定速率又不至于白等太久 */
+    private const val SPEED_SAMPLE_BYTES = 196608L
+
+    /** 用固定样本实测单连接速度（KB/s）；失败/超时返回 0，让该通道排到最后。 */
+    private fun measureSpeed(url: String): Long {
+        return try {
+            val conn = open(url, timeoutMs = 6000)
+            conn.readTimeout = 6000
+            conn.setRequestProperty("Range", "bytes=0-${SPEED_SAMPLE_BYTES - 1}")
+            val code = conn.responseCode
+            if (code !in 200..299) { conn.disconnect(); return 0L }
+            val t0 = System.nanoTime()
+            val deadline = t0 + 6_000_000_000L
+            var bytes = 0L
+            conn.inputStream.use { ins ->
+                val buf = ByteArray(32 * 1024)
+                var n: Int
+                while (ins.read(buf).also { n = it } != -1) {
+                    bytes += n
+                    if (bytes >= SPEED_SAMPLE_BYTES || System.nanoTime() > deadline) break
+                }
+            }
+            conn.disconnect()
+            val ms = (System.nanoTime() - t0) / 1_000_000L
+            if (ms <= 0 || bytes <= 0) 0L else bytes / 1024 * 1000 / ms
+        } catch (e: Exception) {
+            0L
+        }
     }
 
     suspend fun download(
@@ -374,37 +440,59 @@ object UpdateChecker {
             lastDownloadError = "手机存储空间不足（可用 ${free / 1048576}MB，需约 ${needMin / 1048576}MB）"
             return@withContext null
         }
-        // 探测选优后按序尝试
-        val urls = try { probeChannels(url, remote.apkSize) } catch (e: Exception) { candidateUrls(url) }
+        // 探测选优：存活通道按实测速度降序，死通道直接出局（不再进重试列表白等）
+        val channels = try {
+            probeChannels(url, remote.apkSize)
+        } catch (e: Exception) {
+            android.util.Log.w("MTUpdate", "probe threw, fallback to static list", e)
+            candidateUrls(url).map { Channel(it, rangeOk = true, kbps = 0) }
+        }
+        if (channels.isEmpty()) {
+            lastDownloadError = "所有下载通道均不可达（网络受限或镜像故障），请用浏览器打开下载"
+            return@withContext null
+        }
         var lastErr: String? = null
-        for ((i, u) in urls.withIndex()) {
-            // 先试分片并行下载（国内镜像多按单连接限速，多连接可成倍提速）；
-            // 通道不支持 Range 或分片失败时返回 null，自动回退单连接续传。
-            if (remote.apkSize > 0) {
-                try {
-                    val f = downloadSegmented(ctx, u, remote.sha256, remote.apkSize, onProgress)
-                    if (f != null) return@withContext f
-                    android.util.Log.i("MTUpdate", "segmented download unavailable on channel ${i + 1}, fallback")
-                } catch (e: Exception) {
-                    // 分片阶段校验失败（SHA256 不符等）说明通道内容不可信，直接换通道
-                    lastErr = "通道${i + 1}分片下载：${e.message ?: e.javaClass.simpleName}"
-                    android.util.Log.w("MTUpdate", "segmented failed on channel ${i + 1}", e)
-                    onProgress(0)
-                    continue
-                }
+
+        // 阶段 1：跨主机分片并行（最快路径）。
+        // downloadSegmented 内部会自己挑前 MAX_HOSTS 个支持 Range 的通道轮流分配分片，
+        // 所以这里只调一次、传入全部存活通道，不能在通道循环里重复调。
+        if (remote.apkSize > 0 && channels.any { it.rangeOk }) {
+            try {
+                val f = downloadSegmented(ctx, channels, remote.sha256, remote.apkSize, onProgress, onSlow)
+                if (f != null) return@withContext f
+                android.util.Log.i("MTUpdate", "segmented incomplete, fall back to single-connection")
+                // 注意：分片进度存在 seg_N.part，单连接进度存在 update.apk.part，两者**不互通**。
+                // 这里保留 seg 文件是因为用户下次点「更新」时 downloadSegmented 会从断点续传，
+                // 已下载的字节不会白费；但本次回退到单连接只能从 update.apk.part 重新开始。
+            } catch (e: Exception) {
+                // SHA256 校验失败等：说明某个通道内容不可信，丢弃进度后改走单连接逐个试
+                lastErr = "分片下载：${e.message ?: e.javaClass.simpleName}"
+                android.util.Log.w("MTUpdate", "segmented failed, fall back", e)
+                File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates")
+                    .listFiles { f -> f.name.startsWith("seg_") }?.forEach { it.delete() }
             }
+        }
+
+        // 阶段 2：逐通道单连接续传兜底（通道不支持 Range，或分片始终凑不齐）
+        for ((i, ch) in channels.withIndex()) {
+            val u = ch.url
+            val label = "通道${i + 1}"
             var attempt = 0
             while (attempt < 2) {
                 attempt++
                 try {
                     val f = downloadOnce(ctx, u, remote.sha256, remote.apkSize, onProgress, onSlow)
-                    if (f != null) return@withContext f
+                    if (f != null) {
+                        // 单连接已成功，分片残留的 seg_*.part 不再需要，清掉以免白占最多一整包空间
+                        dir.listFiles { file -> file.name.startsWith("seg_") }?.forEach { it.delete() }
+                        return@withContext f
+                    }
                 } catch (e: Exception) {
-                    lastErr = "通道${i + 1}第${attempt}次：${e.message ?: e.javaClass.simpleName}"
+                    lastErr = "$label 第${attempt}次：${e.message ?: e.javaClass.simpleName}"
                     android.util.Log.e("MTUpdate", "download $u attempt $attempt failed", e)
                 }
             }
-            // 换通道前把进度归零提示（part 保留，同通道续传仍有效）
+            // 换通道：进度归零提示（part 保留，同通道重试仍可续传）
             onProgress(0)
         }
         lastDownloadError = lastErr ?: "未知错误"
@@ -420,7 +508,8 @@ object UpdateChecker {
         val out = File(dir, "update.apk")
         val part = File(dir, "update.apk.part")
         var resumeFrom = if (part.exists()) part.length() else 0L
-        // 读超时 12 秒：通道停滞时快速抛错自动切换，不让进度条假死
+        // 读超时 12 秒：只在「完全停滞」时才抛错，让外层换通道；
+        // 速度偏慢但仍在收数据时不抛错、不换通道（旧实现慢就换通道，是死循环的根源）。
         var conn = open(url, timeoutMs = 15000)
         conn.readTimeout = 12000
         conn.setRequestProperty("Range", "bytes=$resumeFrom-")
@@ -442,10 +531,15 @@ object UpdateChecker {
         }
         val reported = conn.contentLengthLong
         val total = if (reported > 0) reported + resumeFrom else -1L
-        // 速率监控：每秒采样，低于 80KB/s 持续 4 秒提示一次"缓慢"
+        // 速率监控与停滞检测：
+        // 旧实现「低于 80KB/s 提示 + 低于 15KB/s 直接抛异常换通道」是死循环的根源——
+        // 实测国内六个通道里常常只有 gh-proxy 活着，且单连接就只有 69KB/s 左右，
+        // 一抛异常就换到死通道，换完更慢再抛，直到通道耗尽下载失败。
+        // 慢并不等于失败：现在只在「完全停滞」时才放弃，速度正常偏低就如实告知并继续下。
         var speedWindowStart = System.currentTimeMillis()
         var speedWindowBytes = 0L
         var lastSlowNotify = 0L
+        var stallRounds = 0
         conn.inputStream.use { input ->
             RandomAccessFile(part, "rw").use { raf ->
                 raf.seek(resumeFrom)
@@ -461,14 +555,24 @@ object UpdateChecker {
                     val elapsed = now - speedWindowStart
                     if (elapsed >= 1000) {
                         val kbps = speedWindowBytes / 1024 * 1000 / elapsed
-                        if (kbps < 80 && now - lastSlowNotify > 5000) {
-                            lastSlowNotify = now
-                            onSlow("当前下载速度较慢（约 ${kbps}KB/s），正在自动切换更快的通道，请耐心等待…")
-                            // 持续龟速时主动断开，让外层切换通道续传
-                            if (kbps < 15) {
+                        if (speedWindowBytes == 0L) {
+                            // 一整秒零字节才算停滞；连续 3 秒才放弃（避免瞬时抖动误杀）
+                            if (++stallRounds >= 3) {
                                 try { input.close() } catch (_: Exception) {}
-                                throw UpdateException("通道速度过慢（${kbps}KB/s），自动切换")
+                                throw UpdateException("通道停滞（连续 ${stallRounds} 秒无数据），已保留进度")
                             }
+                        } else {
+                            stallRounds = 0
+                        }
+                        // 慢只提示，不换通道；且最多每 15 秒提示一次，避免刷屏
+                        if (kbps in 1 until 80 && now - lastSlowNotify > 15000) {
+                            lastSlowNotify = now
+                            val remain = if (total > 0) (total - done) else -1L
+                            val eta = if (remain > 0 && kbps > 0) remain / 1024 / kbps else -1L
+                            onSlow(
+                                if (eta > 0) "当前速度约 ${kbps}KB/s，预计还需 ${fmtEta(eta)}，正在继续下载…"
+                                else "当前速度约 ${kbps}KB/s，正在继续下载…"
+                            )
                         }
                         speedWindowStart = now
                         speedWindowBytes = 0L
@@ -522,25 +626,58 @@ object UpdateChecker {
         return out
     }
 
-    /** 分片并行下载的连接数（国内镜像多为单连接限速，多连接可成倍提速） */
-    private const val SEGMENTS = 6
+    /** 秒数 → 「x分y秒」形式的可读剩余时间 */
+    private fun fmtEta(sec: Long): String = when {
+        sec < 60 -> "${sec}秒"
+        sec < 3600 -> "${sec / 60}分${sec % 60}秒"
+        else -> "${sec / 3600}小时${(sec % 3600) / 60}分"
+    }
 
     /**
-     * 分片并行下载：把安装包按字节切成 [SEGMENTS] 段，多连接同时下载。
+     * 分片并行下载的连接数。
      *
-     * 为什么需要：单连接从 gh-proxy 等国内镜像下 86MB 常被限速到几十 KB/s，
-     * 而镜像多按「单连接」限速，开多连接能成倍提速，直接解决"更新太慢"。
+     * 实测（gh-proxy，18~20 秒窗口）单连接约 69KB/s，聚合速度随并发提升：
+     *   2 连接 186KB/s、4 连接 412/437/452KB/s（三次稳定，约 6 倍）
+     *   6 连接 0KB/s、8 连接 0KB/s（两次复测均为 0）——镜像对高并发直接限流封禁。
+     * 原值 6 正好落在封禁区：分片全部拿不到数据 → 放弃分片 → 回退单连接 69KB/s →
+     * 触发「慢速换通道」→ 换来的是死通道 → 最终下载失败。故取 4，既拿到约 6 倍提速又不触发限流。
+     */
+    private const val SEGMENTS = 4
+
+    /** 每个分片的最大重试次数（失败后从已下载字节续传，不重头开始） */
+    private const val SEG_RETRY = 3
+
+    /** 参与分片下载的主机上限（实测跨主机并行比单主机多连接更快，因节流按主机计） */
+    private const val MAX_HOSTS = 2
+
+    /**
+     * 分片并行下载：把安装包按字节切成 [SEGMENTS] 段，**分散到多个存活主机**同时下载。
      *
-     * 前置条件：已知期望大小、且通道支持 Range（探测阶段已验证）。
-     * 任一分片失败（如通道不支持 206）即清理分片并返回 null，
-     * 由调用方回退到单连接续传 [downloadOnce]，最坏情况等同旧行为。
+     * 为什么这么做（全部为实测结论，gh-proxy 下载 v1.1.1 的 62MB 包）：
+     *  - 单连接约 54KB/s 且随流量衰减（121→26KB/s，按流量节流）；
+     *  - 同一主机 4 连接：135 秒拿到 26.5MB（约 196KB/s）；
+     *  - 跨 2 个主机各 2 连接：135 秒拿到 55.5MB（约 411KB/s）。
+     * 说明节流按主机计，跨主机并行比单主机多连接更快。
+     *  - 并发数不能贪多：同主机 6 连接实测直接归零（触发限流封禁），故 [SEGMENTS]=4。
+     *
+     * 进度保护：分片失败时**只保留、不删除**已下载的分片文件，重试从断点续传，
+     * 且重试时轮换到下一个主机。旧实现在任一分片失败时删除全部分片，
+     * 把已下载的几十 MB 清零重来，是「越下越慢最后失败」的放大器。
+     * 只有 SHA256 校验失败（内容不可信）才丢弃全部进度。
+     *
+     * @param hosts 存活主机列表（已按实测速度降序），取前 [MAX_HOSTS] 个轮流分配分片。
+     *              只有一个时退化为单主机多连接；为空则返回 null 让上层回退单连接。
      */
     private suspend fun downloadSegmented(
-        ctx: Context, url: String, sha256: String?, expectSize: Long,
-        onProgress: (Int) -> Unit
+        ctx: Context, hosts: List<Channel>, sha256: String?, expectSize: Long,
+        onProgress: (Int) -> Unit,
+        onSlow: (String) -> Unit = {}
     ): File? = withContext(Dispatchers.IO) {
         // 太小没必要分片；大小未知无法分片
         if (expectSize < SEGMENTS * 256 * 1024L) return@withContext null
+        if (hosts.isEmpty()) return@withContext null
+        val usable = hosts.filter { it.rangeOk }.take(MAX_HOSTS)
+        if (usable.isEmpty()) return@withContext null
         val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
         val out = File(dir, "update.apk")
         val part = File(dir, "update.apk.part")
@@ -552,55 +689,119 @@ object UpdateChecker {
             i to (s to e)
         }.filter { it.second.first <= it.second.second }
 
+        // 断点续传：已存在的分片文件按其长度计入进度
         val done = java.util.concurrent.atomic.AtomicLong(
-            segFiles.sumOf { if (it.exists()) it.length() else 0L }
+            segFiles.sumOf { if (it.exists()) it.length().coerceAtMost(segSize) else 0L }
         )
-        val failed = java.util.concurrent.atomic.AtomicBoolean(false)
-        try {
-            coroutineScope {
-                ranges.map { (idx, range) ->
-                    val (s, e) = range
-                    async {
-                        val segFile = segFiles[idx]
-                        val wantLen = e - s + 1
-                        if (segFile.exists() && segFile.length() == wantLen) return@async
-                        val ok = downloadSegment(url, segFile, s, e, wantLen) { add ->
-                            val cur = done.addAndGet(add)
-                            onProgress(((cur * 100) / expectSize).toInt().coerceIn(0, 99))
+        // 所有主机都不支持 Range → 整体放弃分片，回退单连接
+        val noRangeVotes = java.util.concurrent.atomic.AtomicInteger(0)
+        val failedSeg = java.util.concurrent.atomic.AtomicInteger(0)
+        // 速度采样：所有分片共用一个聚合窗口
+        val winStart = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+        val winBytes = java.util.concurrent.atomic.AtomicLong(0)
+        val lastSlow = java.util.concurrent.atomic.AtomicLong(0)
+
+        coroutineScope {
+            ranges.map { (idx, range) ->
+                val (s, e) = range
+                async {
+                    val segFile = segFiles[idx]
+                    val wantLen = e - s + 1
+                    if (segFile.exists() && segFile.length() == wantLen) return@async
+                    val onBytes: (Long) -> Unit = { add ->
+                        val cur = done.addAndGet(add)
+                        onProgress(((cur * 100) / expectSize).toInt().coerceIn(0, 99))
+                        // 聚合速度提示：慢只告知，绝不放弃下载
+                        winBytes.addAndGet(add)
+                        val now = System.currentTimeMillis()
+                        val st = winStart.get()
+                        if (now - st >= 1500) {
+                            val kbps = winBytes.get() / 1024 * 1000 / (now - st)
+                            winStart.set(now); winBytes.set(0)
+                            if (kbps in 1 until 300 && now - lastSlow.get() > 15000) {
+                                lastSlow.set(now)
+                                val remain = expectSize - done.get()
+                                val eta = if (kbps > 0) remain / 1024 / kbps else -1L
+                                onSlow(
+                                    if (eta > 0) "当前速度约 ${kbps}KB/s，预计还需 ${fmtEta(eta)}，正在继续下载…"
+                                    else "当前速度约 ${kbps}KB/s，正在继续下载…"
+                                )
+                            }
                         }
-                        if (!ok) failed.set(true)
                     }
-                }.awaitAll()
-            }
-            if (failed.get()) { segFiles.forEach { it.delete() }; return@withContext null }
-            // 合并分片为完整 part 文件
-            if (part.exists()) part.delete()
-            RandomAccessFile(part, "rw").use { raf ->
-                for ((idx, _) in ranges) {
-                    segFiles[idx].inputStream().use { ins ->
-                        val buf = ByteArray(64 * 1024)
-                        var n: Int
-                        while (ins.read(buf).also { n = it } != -1) raf.write(buf, 0, n)
+                    var ok = false
+                    var attempt = 0
+                    while (!ok && attempt < SEG_RETRY) {
+                        // 每次重试轮换主机：某个主机被节流或掉线时自动换一个
+                        val host = usable[attempt % usable.size]
+                        attempt++
+                        when (downloadSegment(host.url, segFile, s, e, wantLen, onBytes)) {
+                            SEG_RESULT_OK -> ok = true
+                            SEG_RESULT_NO_RANGE -> {
+                                noRangeVotes.incrementAndGet()
+                                android.util.Log.w("MTUpdate", "seg $idx: host does not support Range")
+                            }
+                            else -> {
+                                android.util.Log.w(
+                                    "MTUpdate",
+                                    "seg $idx attempt $attempt failed, have ${segFile.length()}/$wantLen, will resume"
+                                )
+                            }
+                        }
                     }
+                    if (!ok) failedSeg.incrementAndGet()
+                }
+            }.awaitAll()
+        }
+
+        if (noRangeVotes.get() >= usable.size) {
+            android.util.Log.i("MTUpdate", "no host supports Range, abandon segmented")
+            return@withContext null
+        }
+        if (failedSeg.get() > 0) {
+            // 保留已完成/部分完成的分片文件：下次重试可续传，不浪费已下载的字节
+            android.util.Log.w("MTUpdate", "${failedSeg.get()} segment(s) incomplete, progress kept for resume")
+            return@withContext null
+        }
+        // 合并分片为完整 part 文件
+        if (part.exists()) part.delete()
+        RandomAccessFile(part, "rw").use { raf ->
+            for ((idx, _) in ranges) {
+                segFiles[idx].inputStream().use { ins ->
+                    val buf = ByteArray(64 * 1024)
+                    var n: Int
+                    while (ins.read(buf).also { n = it } != -1) raf.write(buf, 0, n)
                 }
             }
-            segFiles.forEach { it.delete() }
-            if (part.length() != expectSize) { part.delete(); return@withContext null }
+        }
+        segFiles.forEach { it.delete() }
+        if (part.length() != expectSize) { part.delete(); return@withContext null }
+        try {
             finalizeDownload(part, out, sha256, expectSize, onProgress)
         } catch (e: Exception) {
+            // 只有校验失败（内容不可信）才真的丢弃进度，由上层换通道重下
+            android.util.Log.e("MTUpdate", "segmented verify failed, discard progress", e)
             segFiles.forEach { it.delete() }
             if (part.exists()) part.delete()
             throw e
         }
     }
 
-    /** 下载单个分片到独立文件，支持分片级续传；通道不支持 Range（非 206）则返回 false */
+    /** 分片下载结果码 */
+    private const val SEG_RESULT_OK = 0
+    private const val SEG_RESULT_NO_RANGE = 1
+    private const val SEG_RESULT_FAIL = 2
+
+    /**
+     * 下载单个分片到独立文件，从已下载字节续传。
+     * @return [SEG_RESULT_OK] 完成 / [SEG_RESULT_NO_RANGE] 通道不支持 Range / [SEG_RESULT_FAIL] 需重试
+     */
     private fun downloadSegment(
         url: String, segFile: File, start: Long, end: Long, wantLen: Long,
         onBytes: (Long) -> Unit
-    ): Boolean {
-        var resume = if (segFile.exists()) segFile.length() else 0L
-        if (resume >= wantLen) return true
+    ): Int {
+        var resume = if (segFile.exists()) segFile.length().coerceAtMost(wantLen) else 0L
+        if (resume >= wantLen) return SEG_RESULT_OK
         return try {
             var conn = open(url, timeoutMs = 15000)
             conn.readTimeout = 12000
@@ -613,8 +814,8 @@ object UpdateChecker {
                 conn.setRequestProperty("Range", "bytes=${start}-${end}")
                 code = conn.responseCode
             }
-            // 分片下载必须服务端支持 Range；返回 200 说明不支持，放弃分片让上层回退
-            if (code != 206) { conn.disconnect(); return false }
+            // 必须支持 Range；返回 200 说明不支持，让上层回退单连接
+            if (code != 206) { conn.disconnect(); return SEG_RESULT_NO_RANGE }
             conn.inputStream.use { input ->
                 RandomAccessFile(segFile, "rw").use { raf ->
                     raf.seek(resume)
@@ -627,9 +828,9 @@ object UpdateChecker {
                 }
             }
             conn.disconnect()
-            segFile.length() == wantLen
+            if (segFile.length() == wantLen) SEG_RESULT_OK else SEG_RESULT_FAIL
         } catch (e: Exception) {
-            false
+            SEG_RESULT_FAIL
         }
     }
 
