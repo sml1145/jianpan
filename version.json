@@ -1,8 +1,8 @@
-﻿{
-    "version":  "v1.0.10",
-    "versionCode":  10,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.0.10/mengting-ime-v1.0.10.apk",
-    "sha256":  "dcc9234d38a768eb549ed20f55c1635a86f16d54da9e4ac80bf6c219d3f7ee2c",
-    "notes":  "修复候选词上屏错词(手势key绑定候选内容)；键盘三行各10键+分词键+删除双宽上移+大写上移；翻译输入框常驻去翻译键；功能条文字标签重排；单手模式入副页；组件应用内预览；标题居中；下载停滞自动切通道+慢速提示。",
-    "apkSize":  85995394
+{
+    "version":  "v1.1.0",
+    "versionCode":  11,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.1.0/mengting-ime-v1.1.0.apk",
+    "sha256":  "a72714b0d68a0b571dc623f4f6032fc997d9b1d2bd04408de8beb726117ddbed",
+    "notes":  "9项优化：输入过的候选词按频次自动前移；翻译框一分为二(中↔英自动互译+各自语言字符过滤)；修复回车键误触返回并按场景显示回车/搜索/发送/完成+多行换行；修复符号面板翻页跳级(手势闭包刷新)；版本号进位逻辑修正(1.0.9→1.1.0)；手写模式非GMS设备崩溃保护；新增字典按钮(手写板离线查读音与例词)；新增语音按钮(长文语音转写开关)；模拟器窗口缩放适配。",
+    "apkSize":  86011782
 }

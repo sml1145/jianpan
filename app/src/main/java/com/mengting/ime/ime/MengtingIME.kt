@@ -17,6 +17,7 @@ import com.mengting.ime.core.AppPrefs
 import com.mengting.ime.core.ClipboardHistory
 import com.mengting.ime.core.PinyinEngine
 import com.mengting.ime.core.TypingStats
+import com.mengting.ime.core.UserDict
 import com.mengting.ime.feature.audio.KeySoundManager
 import com.mengting.ime.feature.translate.TranslateHelper
 import com.mengting.ime.feature.voice.VoiceInputController
@@ -113,6 +114,7 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     override fun commitText(text: String) {
         currentInputConnection?.commitText(text, 1)
         TypingStats.onWordCommitted(text)
+        UserDict.record(text)
         state.clearComposition()
         if (state.capsMode == 1) state.capsMode = 0
     }
@@ -168,20 +170,60 @@ class MengtingIME : InputMethodService(), KeyboardHost {
     override fun sendEnter() {
         val ic = currentInputConnection ?: return
         val ei = currentInputEditorInfo
-        val action = ei?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
-        if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+        val imeOptions = ei?.imeOptions ?: 0
+        val inputType = ei?.inputType ?: 0
+        val action = imeOptions and EditorInfo.IME_MASK_ACTION
+
+        // 多行文本框：回车永远是换行
+        val multiline = (inputType and EditorInfo.TYPE_MASK_CLASS) == EditorInfo.TYPE_CLASS_TEXT &&
+            (inputType and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+        // 显式声明"回车不触发动作"
+        val noEnterAction = (imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+
+        if (!multiline && !noEnterAction && action != EditorInfo.IME_ACTION_NONE &&
+            action != EditorInfo.IME_ACTION_UNSPECIFIED) {
             ic.performEditorAction(action)
         } else {
             ic.commitText("\n", 1)
         }
     }
 
+    /** 回车键显示的文字：随编辑器动作变化（换行/搜索/发送/前往/下一项/完成） */
+    override fun enterKeyLabel(): String {
+        val ei = currentInputEditorInfo ?: return "回车"
+        val imeOptions = ei.imeOptions
+        val inputType = ei.inputType
+        val action = imeOptions and EditorInfo.IME_MASK_ACTION
+        val multiline = (inputType and EditorInfo.TYPE_MASK_CLASS) == EditorInfo.TYPE_CLASS_TEXT &&
+            (inputType and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+        val noEnterAction = (imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        if (multiline || noEnterAction || action == EditorInfo.IME_ACTION_NONE ||
+            action == EditorInfo.IME_ACTION_UNSPECIFIED) return "回车"
+        return when (action) {
+            EditorInfo.IME_ACTION_SEARCH -> "搜索"
+            EditorInfo.IME_ACTION_SEND -> "发送"
+            EditorInfo.IME_ACTION_GO -> "前往"
+            EditorInfo.IME_ACTION_NEXT -> "下一项"
+            EditorInfo.IME_ACTION_DONE -> "完成"
+            else -> "回车"
+        }
+    }
+
     override fun onSpaceLongPress() {
+        voiceStart()
+    }
+
+    override fun onSpaceRelease() {
+        voiceStop()
+    }
+
+    /** 语音面板显式开始：点按麦克风开始长时听写 */
+    override fun voiceStart() {
+        if (state.listening) return
         state.listening = true
         var committed = 0
         voice.start(
             onResult = { text ->
-                // 增量结果：回退已提交部分再提交新文本
                 val ic = currentInputConnection ?: return@start
                 if (committed > 0) {
                     ic.deleteSurroundingText(committed, 0)
@@ -190,17 +232,18 @@ class MengtingIME : InputMethodService(), KeyboardHost {
                 if (text.isNotBlank()) {
                     ic.commitText(text, 1)
                     committed = text.length
+                    TypingStats.onCharCommitted(text.length)
                 }
             },
             onStatus = { msg -> state.voiceStatus = msg }
         )
     }
 
-    override fun onSpaceRelease() {
+    /** 语音面板显式停止 */
+    override fun voiceStop() {
         if (state.listening) {
             state.listening = false
             voice.stop()
-            TypingStats.onCharCommitted(0)
         }
     }
 

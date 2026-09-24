@@ -221,9 +221,37 @@ object PinyinEngine {
         return results.toList()
     }
 
-    fun addUserWord(word: String) {
-        userBoost[word] = (userBoost[word] ?: 0) + 100
+    fun addUserWord(word: String, count: Int = 1) {
+        userBoost[word] = count
+        // 按拼音键与简拼键建索引，供候选时把用户词强制前置
+        val key = pinyinOf(word)
+        if (key != null) {
+            synchronized(userWordsByKey) {
+                userWordsByKey.getOrPut(key) { ArrayList() }.let { if (!it.contains(word)) it.add(word) }
+                for (init in initialsVariants(key)) {
+                    if (init.length < 2) continue
+                    userWordsByInitials.getOrPut(init) { ArrayList() }.let { if (!it.contains(word)) it.add(word) }
+                }
+            }
+        }
     }
+
+    /** 词 → 拼音键（逐字取首读音拼接）；含未知字或含非汉字返回 null */
+    private fun pinyinOf(word: String): String? {
+        if (word.isEmpty()) return null
+        val sb = StringBuilder()
+        for (ch in word) {
+            if (ch.code < 0x4E00 || ch.code > 0x9FFF) return null
+            val pys = charPinyins[ch] ?: return null
+            if (pys.isEmpty()) return null
+            sb.append(pys[0])
+        }
+        return sb.toString()
+    }
+
+    /** 用户词索引：拼音键 / 简拼键 → 词（用于候选前置提权） */
+    private val userWordsByKey = HashMap<String, ArrayList<String>>()
+    private val userWordsByInitials = HashMap<String, ArrayList<String>>()
 
     /** 云端热词合并（HotWordStore 调用） */
     fun addHotWords(entries: List<Triple<String, String, Int>>) {
@@ -270,7 +298,19 @@ object PinyinEngine {
         if (effective.isEmpty() || effective.any { !it.isLetter() }) return emptyList()
         val out = LinkedHashSet<String>()
 
-        // 0) 云端热词（联网增强）：精确键 → 简拼
+        // 0) 用户历史词最前置（越常用越靠前，第 1 项需求）
+        synchronized(userWordsByKey) {
+            userWordsByKey[effective]?.let { list ->
+                list.sortedByDescending { userBoost[it] ?: 0 }.forEach { out.add(it) }
+            }
+            if (effective.length >= 2) {
+                userWordsByInitials[effective]?.let { list ->
+                    list.sortedByDescending { userBoost[it] ?: 0 }.forEach { if (out.size < 6) out.add(it) }
+                }
+            }
+        }
+
+        // 1) 云端热词（联网增强）：精确键 → 简拼
         synchronized(hotByKey) {
             hotByKey[effective]?.let { out.addAll(it) }
             if (effective.length >= 2) hotByInitials[effective]?.let { out.addAll(it) }
@@ -462,4 +502,27 @@ object PinyinEngine {
     }
 
     fun charCandidates(pinyin: String): List<Char> = pyChars[pinyin] ?: emptyList()
+
+    /** 单字全部读音（无声调，去重） */
+    fun charPinyin(ch: Char): List<String> = charPinyins[ch]?.toList() ?: emptyList()
+
+    /**
+     * 组词示例：从本地词库找包含该字的常见词（本地数据，离线可靠）。
+     * 优先该字开头的词，其次该字在中间的词。
+     */
+    fun wordsContaining(ch: Char, limit: Int = 12): List<String> {
+        val idx = index ?: return emptyList()
+        val starts = ArrayList<String>()
+        val contains = ArrayList<String>()
+        for (w in idx.words) {
+            if (w.length < 2 || w.length > 4) continue
+            if (w[0] == ch) starts.add(w)
+            else if (w.contains(ch)) contains.add(w)
+            if (starts.size >= limit) break
+        }
+        val out = LinkedHashSet<String>()
+        out.addAll(starts)
+        for (w in contains) { if (out.size >= limit) break; out.add(w) }
+        return out.toList().take(limit)
+    }
 }

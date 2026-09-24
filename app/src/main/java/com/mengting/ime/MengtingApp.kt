@@ -6,6 +6,7 @@ import com.mengting.ime.core.EnglishEngine
 import com.mengting.ime.core.HotWordStore
 import com.mengting.ime.core.PinyinEngine
 import com.mengting.ime.core.TypingStats
+import com.mengting.ime.core.UserDict
 import com.mengting.ime.feature.sms.SmsCodeHolder
 import com.mengting.ime.feature.voice.ModelStore
 import com.mengting.ime.feature.voice.VoiceInputController
@@ -27,6 +28,7 @@ class MengtingApp : Application() {
         instance = this
         AppPrefs.init(this)
         TypingStats.init(this)
+        UserDict.init(this)
         SmsCodeHolder.register(this)
         scope.launch { PinyinEngine.ensureLoaded(this@MengtingApp) }
         scope.launch { EnglishEngine.ensureLoaded(this@MengtingApp) }
