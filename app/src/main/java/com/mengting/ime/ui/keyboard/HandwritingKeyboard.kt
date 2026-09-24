@@ -14,10 +14,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -31,125 +33,93 @@ import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.common.model.RemoteModelManager
-import com.google.mlkit.vision.digitalink.DigitalInkRecognition
-import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModel
-import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModelIdentifier
-import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
-import com.google.mlkit.vision.digitalink.Ink
-import com.google.mlkit.vision.digitalink.RecognitionContext
-import com.google.mlkit.vision.digitalink.WritingArea
+import com.mengting.ime.feature.handwriting.HandwritingModelStore
+import com.mengting.ime.feature.handwriting.HandwritingRecognizer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
- * 手写键盘：画板 + MLKit 数字墨水识别（简体中文 ZH_HANI_CN，模型按需下载）。
- * 稳定性：MLKit 依赖 Google Play 服务，无 GMS 或创建失败时全程降级为提示，绝不崩溃；
- * 识别在后台线程回调，不阻塞绘制，避免死机。
+ * 手写键盘：画板 + 本地 ONNX 离线识别（达摩院中英文手写模型）。
+ *
+ * 为什么不再用 MLKit：MLKit Digital Ink 的模型只能经 Google Play 服务动态下发，
+ * 不支持随包内置，无 GMS 设备（国内大量机型）根本拿不到模型，只能显示"无法识别"。
+ * 现在改为本地推理，模型下到 filesDir 后永久离线可用，与 Google 服务完全解耦。
+ *
+ * 稳定性：识别在后台线程执行（单次约 150~400ms），绘制不阻塞；模型加载/推理全程
+ * try-catch，失败降级为文字提示，绝不崩溃。
  */
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPickChar: ((String) -> Unit)? = null) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     val points = remember { mutableStateListOf<Offset>() }
+    val strokes = remember { mutableStateListOf<List<Offset>>() }
     var cands by remember { mutableStateOf<List<String>>(emptyList()) }
-    var status by remember { mutableStateOf("正在初始化手写…") }
-
-    // GMS 可用性 + MLKit 客户端：全程 try-catch，失败降级
-    val gmsAvailable = remember(context) {
-        try {
-            val code = com.google.android.gms.common.GoogleApiAvailability.getInstance()
-                .isGooglePlayServicesAvailable(context)
-            code == com.google.android.gms.common.ConnectionResult.SUCCESS
-        } catch (e: Throwable) { false }
-    }
-
-    val model = remember {
-        try {
-            DigitalInkRecognitionModel
-                .builder(DigitalInkRecognitionModelIdentifier.ZH_HANI_CN)
-                .build()
-        } catch (e: Throwable) { null }
-    }
-    val recognizer = remember(model) {
-        if (!gmsAvailable || model == null) null
-        else try {
-            val opts = DigitalInkRecognizerOptions.builder(model).build()
-            DigitalInkRecognition.getClient(opts)
-        } catch (e: Throwable) { null }
-    }
-    val modelManager = remember {
-        if (!gmsAvailable) null else try { RemoteModelManager.getInstance() } catch (e: Throwable) { null }
-    }
-    val strokesRef = remember { mutableListOf<Ink.Stroke>() }
+    var status by remember { mutableStateOf("正在准备手写…") }
     var recognizing by remember { mutableStateOf(false) }
 
-    // 初始化状态提示
-    LaunchedEffect(gmsAvailable, recognizer, model) {
-        status = when {
-            !gmsAvailable -> "本设备缺少 Google Play 服务，手写识别不可用"
-            model == null || recognizer == null -> "手写组件初始化失败"
-            else -> "在此手写，抬笔自动识别"
+    val modelStatus by HandwritingModelStore.status.collectAsState()
+
+    // 进入面板：若模型缺失则后台拉取，若已就绪则预加载会话（首次加载 73MB 权重需数秒）
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            if (!HandwritingModelStore.isReady(context)) {
+                HandwritingModelStore.download(context, scope)
+                status = "首次使用，正在下载手写模型…"
+            } else if (!HandwritingRecognizer.ensureLoaded(context)) {
+                status = "手写组件初始化失败：" + (HandwritingRecognizer.lastError ?: "未知原因")
+            }
+        }
+    }
+
+    // 下载进度实时反馈
+    LaunchedEffect(modelStatus) {
+        when (val st = modelStatus) {
+            is HandwritingModelStore.Status.Downloading ->
+                status = "正在下载手写模型 ${st.percent}%…"
+            is HandwritingModelStore.Status.Failed ->
+                status = st.msg
+            HandwritingModelStore.Status.Ready -> {
+                if (!HandwritingRecognizer.ensureLoaded(context)) {
+                    status = "手写模型加载失败：" + (HandwritingRecognizer.lastError ?: "未知原因")
+                } else {
+                    status = "在此手写，抬笔自动识别"
+                }
+            }
+            HandwritingModelStore.Status.Unknown -> { /* 保持当前提示 */ }
         }
     }
 
     fun recognizeAll() {
-        val r = recognizer
-        val m = model
-        val mm = modelManager
-        if (r == null || m == null || mm == null) return
-        if (strokesRef.isEmpty()) return
-        recognizing = true
-        try {
-            val inkBuilder = Ink.builder()
-            for (s in strokesRef) inkBuilder.addStroke(s)
-            val ink = inkBuilder.build()
-            val ctx = RecognitionContext.builder()
-                .setWritingArea(WritingArea(1080f, 600f))
-                .build()
-            r.recognize(ink, ctx)
-                .addOnSuccessListener { result ->
-                    recognizing = false
-                    try {
-                        cands = result.candidates.take(8).map { it.text }
-                        status = if (cands.isEmpty()) "无识别结果，请重写" else "点选候选上屏"
-                    } catch (e: Throwable) { status = "结果解析失败" }
-                }
-                .addOnFailureListener { e ->
-                    recognizing = false
-                    val msg = e.message ?: ""
-                    if (msg.contains("download", true) || msg.contains("model", true) || msg.contains("install", true)) {
-                        status = "正在下载手写模型（首次需联网）…"
-                        try {
-                            mm.download(m, DownloadConditions.Builder().build())
-                                .addOnSuccessListener { status = "模型就绪，请重新书写" }
-                                .addOnFailureListener { d -> status = "模型下载失败：${d.message?.take(30)}" }
-                        } catch (ex: Throwable) { status = "模型下载异常" }
-                    } else {
-                        status = "识别失败：${msg.take(30)}"
-                    }
-                }
-        } catch (e: Throwable) {
-            recognizing = false
-            status = "识别异常：${e.message?.take(30)}"
+        if (strokes.isEmpty()) return
+        if (!HandwritingRecognizer.ensureLoaded(context)) {
+            status = "手写模型未就绪：" + (HandwritingRecognizer.lastError ?: "请先联网下载模型")
+            return
         }
-    }
-
-    // 进入时静默预下载模型（仅 GMS 可用时）
-    LaunchedEffect(modelManager, model) {
-        val mm = modelManager; val m = model
-        if (mm == null || m == null) return@LaunchedEffect
-        try {
-            mm.isModelDownloaded(m).addOnSuccessListener { downloaded ->
-                if (!downloaded) {
-                    status = "首次使用正在下载手写模型…"
-                    try {
-                        mm.download(m, DownloadConditions.Builder().build())
-                            .addOnSuccessListener { status = "手写模型就绪，请书写" }
-                            .addOnFailureListener { status = "模型下载失败（需联网），请检查网络" }
-                    } catch (e: Throwable) { status = "模型下载异常" }
+        recognizing = true
+        val snapshot = strokes.toList()
+        scope.launch {
+            val text = withContext(Dispatchers.Default) {
+                try {
+                    HandwritingRecognizer.recognize(snapshot)
+                } catch (t: Throwable) {
+                    ""
                 }
-            }.addOnFailureListener { status = "手写模型状态获取失败" }
-        } catch (e: Throwable) { status = "手写初始化异常" }
+            }
+            recognizing = false
+            if (text.isBlank()) {
+                cands = emptyList()
+                status = "无识别结果，请重写"
+            } else {
+                // 单字场景通常整串就是结果；多字时按字符拆开供逐字点选
+                val chars = text.map { it.toString() }
+                cands = if (chars.size == 1) chars else listOf(text) + chars
+                status = "点选候选上屏"
+            }
+        }
     }
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
@@ -160,8 +130,11 @@ fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPick
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (cands.isEmpty()) {
-                Text(status, fontSize = 12.sp, color = Color(0xFF4A2B5A),
-                    modifier = Modifier.padding(horizontal = 10.dp), maxLines = 1)
+                Text(
+                    if (recognizing) "识别中…" else status,
+                    fontSize = 12.sp, color = Color(0xFF4A2B5A),
+                    modifier = Modifier.padding(horizontal = 10.dp), maxLines = 1
+                )
             } else {
                 for (c in cands.take(6)) {
                     Box(
@@ -172,15 +145,15 @@ fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPick
                                 host.playKeySound(com.mengting.ime.feature.audio.KeySoundManager.KIND_TAP)
                                 onPickChar?.invoke(c)
                                 cands = emptyList()
-                                strokesRef.clear()
+                                strokes.clear()
                                 status = "在此手写，抬笔自动识别"
                             }
                             .padding(horizontal = 10.dp, vertical = 4.dp)
-                    ) { Text(c, fontSize = 18.sp, color = Color(0xFF2B1B33)) }
+                    ) { Text(c, fontSize = 18.sp, color = Color(0xFF2B1B33), maxLines = 1) }
                 }
                 Spacer(Modifier.weight(1f))
                 Text("✕", fontSize = 14.sp, color = Color(0xFFB23A8F),
-                    modifier = Modifier.pointerTapSafe("clear") { cands = emptyList(); strokesRef.clear() }
+                    modifier = Modifier.pointerTapSafe("clear") { cands = emptyList(); strokes.clear() }
                         .padding(horizontal = 10.dp))
             }
         }
@@ -193,22 +166,25 @@ fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPick
                         MotionEvent.ACTION_DOWN -> { points.add(Offset(ev.x, ev.y)); true }
                         MotionEvent.ACTION_MOVE -> { points.add(Offset(ev.x, ev.y)); true }
                         MotionEvent.ACTION_UP -> {
-                            if (points.size >= 2) {
-                                try {
-                                    val sb = Ink.Stroke.builder()
-                                    for (p in points) sb.addPoint(Ink.Point.create(p.x, p.y))
-                                    strokesRef.add(sb.build())
-                                } catch (e: Throwable) {}
-                            }
+                            if (points.size >= 2) strokes.add(points.toList())
                             points.clear()
-                            if (recognizer != null) recognizeAll()
+                            recognizeAll()
                             true
                         }
                         else -> false
                     }
                 }
         ) {
+            // 已完成的笔画 + 当前正在画的笔画都要显示
             Canvas(Modifier.fillMaxWidth().height(200.dp)) {
+                for (st in strokes) {
+                    if (st.size < 2) continue
+                    val path = Path()
+                    path.moveTo(st[0].x, st[0].y)
+                    for (i in 1 until st.size) path.lineTo(st[i].x, st[i].y)
+                    drawPath(path, Color(0xFF2B1B33),
+                        style = Stroke(width = 8f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                }
                 if (points.size > 1) {
                     val path = Path()
                     path.moveTo(points[0].x, points[0].y)
@@ -225,8 +201,8 @@ fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPick
                 Modifier.weight(1f).height(42.dp).padding(2.dp)
                     .background(Color(0xAAFFFFFF), RoundedCornerShape(8.dp))
                     .pointerTapSafe("undo") {
-                        if (strokesRef.isNotEmpty()) {
-                            strokesRef.removeAt(strokesRef.size - 1)
+                        if (strokes.isNotEmpty()) {
+                            strokes.removeAt(strokes.size - 1)
                             cands = emptyList()
                             status = "已撤销一笔"
                         }
@@ -237,7 +213,7 @@ fun HandwritingKeyboard(host: KeyboardHost, commitOnPick: Boolean = true, onPick
                 Modifier.weight(1f).height(42.dp).padding(2.dp)
                     .background(Color(0xAAFFFFFF), RoundedCornerShape(8.dp))
                     .pointerTapSafe("clr") {
-                        strokesRef.clear(); points.clear(); cands = emptyList()
+                        strokes.clear(); points.clear(); cands = emptyList()
                         status = "在此手写，抬笔自动识别"
                     },
                 contentAlignment = Alignment.Center

@@ -31,7 +31,15 @@ object PinyinEngine {
         val keysSorted: Array<String>,
         val idxSorted: IntArray,
         /** 简拼首字母 → 词下标 */
-        val byInitials: Map<String, IntArray>
+        val byInitials: Map<String, IntArray>,
+        /** 混合简拼缩写分桶：key = 首字母序号*(MAX_SYL+1)+音节数 → 按词频降序的词下标 */
+        val abbrBuckets: Map<Int, IntArray>,
+        /** 每个词的音节拼接串（如 "nihao"），用于缩写匹配 */
+        val wordSylJoined: Array<String?>,
+        /** 每个词的音节长度数组，用于缩写匹配 */
+        val wordSylLens: Array<IntArray?>,
+        /** log(词频总和)，用于对数概率打分 */
+        val logWordTotal: Double
     )
 
     @Volatile private var index: WordIndex? = null
@@ -49,7 +57,13 @@ object PinyinEngine {
     private val hotByInitials = HashMap<String, ArrayList<String>>()
 
     private const val STAGE1_WORDS = 30000
-    private const val MAX_WORDS = 250000
+    /** 词库全量加载上限（用户要求强化词库、不限制应用体积，故留足余量） */
+    private const val MAX_WORDS = 1200000
+    /** 混合简拼 beam 切分参数 */
+    private const val MAX_SYL = 8
+    private const val BEAM = 5
+    private const val CHAR_MIX = 1.2
+    @Volatile private var logCharTotal = 0.0
 
     fun ensureLoaded(ctx: Context) {
         if (ready) return
@@ -119,13 +133,17 @@ object PinyinEngine {
                 }
             }
         }
+        var charTotal = 0L
         ctx.assets.open("dict/char_freq.txt").bufferedReader().useLines { lines ->
             for (ln in lines) {
                 val p = ln.split('\t')
                 if (p.size < 2 || p[0].isEmpty()) continue
-                charFreq[p[0][0]] = p[1].toIntOrNull() ?: 0
+                val f = p[1].toIntOrNull() ?: 0
+                charFreq[p[0][0]] = f
+                charTotal += f
             }
         }
+        logCharTotal = kotlin.math.ln(charTotal.coerceAtLeast(1).toDouble())
         for ((_, list) in pyChars) list.sortByDescending { charFreq[it] ?: 0 }
     }
 
@@ -197,8 +215,53 @@ object PinyinEngine {
             initFinal[k] = sorted.take(40).toIntArray()
         }
 
-        index = WordIndex(wArr, fArr, mMap, keysSorted, idxSorted, initFinal)
+        // 混合简拼缩写索引：按「首字母 × 音节数」分桶，词下标只存一份（内存友好）。
+        // 有了它 nhao(n+全拼hao)、jttqzmy(全首字母接力) 这类输入才能命中词。
+        var freqTotal = 0L
+        for (f in fArr) freqTotal += f.toLong()
+        val logWTotal = kotlin.math.ln(freqTotal.coerceAtLeast(1).toDouble())
+
+        val sylJoined = arrayOfNulls<String>(wArr.size)
+        val sylLens = arrayOfNulls<IntArray>(wArr.size)
+        val bucketTmp = HashMap<Int, ArrayList<Int>>(26 * (MAX_SYL + 1))
+        for (id in wArr.indices) {
+            val w = wArr[id]
+            if (w.length < 2) continue
+            val syl = wordSyllables(w) ?: continue
+            val n = syl.size
+            if (n > MAX_SYL) continue
+            val lens = IntArray(n)
+            val joined = StringBuilder()
+            for (i in 0 until n) { lens[i] = syl[i].length; joined.append(syl[i]) }
+            sylJoined[id] = joined.toString()
+            sylLens[id] = lens
+            val key = (syl[0][0] - 'a') * (MAX_SYL + 1) + n
+            bucketTmp.getOrPut(key) { ArrayList() }.add(id)
+        }
+        val buckets = HashMap<Int, IntArray>(bucketTmp.size)
+        for ((k, v) in bucketTmp) {
+            v.sortByDescending { fArr[it] }
+            buckets[k] = v.toIntArray()
+        }
+
+        index = WordIndex(
+            wArr, fArr, mMap, keysSorted, idxSorted, initFinal,
+            buckets, sylJoined, sylLens, logWTotal
+        )
         _indexVersion.value = _indexVersion.value + 1
+    }
+
+    /** 逐字取首读音，返回音节列表；含未知字或非汉字返回 null */
+    private fun wordSyllables(word: String): List<String>? {
+        if (word.isEmpty()) return null
+        val out = ArrayList<String>(word.length)
+        for (ch in word) {
+            if (ch.code < 0x4E00 || ch.code > 0x9FFF) return null
+            val pys = charPinyins[ch] ?: return null
+            if (pys.isEmpty()) return null
+            out.add(pys[0])
+        }
+        return out
     }
 
     /** 拼音键 → 所有可能的首字母串（DP 处理 xian→x/xa 类歧义，最多 4 组） */
@@ -290,11 +353,11 @@ object PinyinEngine {
         return set.toList().take(12)
     }
 
-    /** 全拼输入串 -> 候选词列表（前缀/简拼/整句全覆盖） */
+    /** 全拼输入串 -> 候选词列表（前缀/简拼/混合简拼/整句 beam 全覆盖） */
     fun candidates(input: String, limit: Int = 30): List<String> {
         if (input.isEmpty() || !charsReady) return emptyList()
         // 分词符（撇号）仅用于切分歧义，不参与匹配
-        val effective = input.replace("'", "")
+        val effective = input.replace("'", "").lowercase()
         if (effective.isEmpty() || effective.any { !it.isLetter() }) return emptyList()
         val out = LinkedHashSet<String>()
 
@@ -317,29 +380,165 @@ object PinyinEngine {
         }
 
         val idx = index
-        if (effective.length <= 2) {
-            // 短输入：简拼词优先，其次单字（精确音节 → 前缀音节）
-            if (idx != null && effective.length == 2) {
-                idx.byInitials[effective]?.let { arr ->
-                    for (i in arr) if (out.size < limit) out.add(idx.words[i])
+
+        // 2) 输入恰好是一个完整音节 → 单字最优先（第 7 项需求：pai 先出 牌/拍/排，
+        //    再出 排队/拍照 这类前缀词）。
+        if (syllables.contains(effective)) {
+            for (v in fuzzyVariants(effective)) {
+                pyChars[v]?.let { chars ->
+                    for (c in chars) if (out.size < limit) out.add(c.toString())
                 }
             }
-            addCharsFor(out, effective, limit)
-            if (idx != null) addPrefixWords(idx, out, effective, limit, 6)
-        } else {
-            // 长输入：整句切分 → 前缀词 → 简拼词 → 单字
-            if (idx != null) {
-                for (w in segmentTop(effective, idx, 4)) if (out.size < limit) out.add(w)
+        }
+
+        // 3) beam DP 整句/混合简拼切分（第 1、4 项需求）
+        if (idx != null && effective.length >= 2) {
+            for (w in segmentBeam(effective, idx, BEAM)) if (out.size < limit) out.add(w)
+        }
+
+        // 4) 兜底与补充：短输入补单字，长输入补前缀词
+        if (idx != null) {
+            if (effective.length <= 2) {
+                addCharsFor(out, effective, limit)
+                idx.byInitials[effective]?.let { arr ->
+                    for (i in arr) if (out.size < limit) idx.words[i].let { out.add(it) }
+                }
+                addPrefixWords(idx, out, effective, limit, 6)
+            } else {
                 addPrefixWords(idx, out, effective, limit, 10)
                 idx.byInitials[effective]?.let { arr ->
                     for (i in arr.take(6)) if (out.size < limit) out.add(idx.words[i])
                 }
-            } else {
-                for (w in fallbackSplit(effective)) if (out.size < limit) out.add(w)
+                if (out.size < limit) addCharsFor(out, effective, limit)
             }
+        } else {
+            for (w in fallbackSplit(effective)) if (out.size < limit) out.add(w)
             addCharsFor(out, effective, limit)
         }
         return out.toList().take(limit)
+    }
+
+    /**
+     * beam 切分：把输入拆成若干段，每段可以是
+     *   a) 词的全拼精确键
+     *   b) 词的混合简拼缩写（每个音节取全拼或首字母，如 n+hao=nhao、全首字母=jttqzmy）
+     *   c) 单字（仅当该段是一个完整音节）
+     * 打分用各自分布内的对数概率，段越多总分越低，因此整词天然优于单字堆叠。
+     */
+    private fun segmentBeam(input: String, idx: WordIndex, beam: Int): List<String> {
+        val n = input.length
+        val beams = Array(n + 1) { ArrayList<SegPath>(beam) }
+        beams[0].add(SegPath("", 0.0))
+        val logWTotal = idx.logWordTotal
+
+        val abbrBuf = ArrayList<Int>(16)
+        for (pos in 0 until n) {
+            if (beams[pos].isEmpty()) continue
+            for (end in pos + 1..minOf(n, pos + 10)) {
+                val key = input.substring(pos, end)
+                val span = end - pos
+
+                // a) 全拼精确词
+                idx.byPy[key]?.let { ids ->
+                    val take = minOf(ids.size, 3)
+                    for (i in 0 until take) {
+                        val id = ids[i]
+                        extendBeam(beams, pos, end, idx.words[id],
+                            kotlin.math.ln(idx.freqs[id] + 1.0) - logWTotal, beam)
+                    }
+                }
+                // b) 混合简拼缩写词
+                if (span in 2..MAX_SYL) {
+                    abbrBuf.clear()
+                    collectAbbr(idx, input, pos, end, 4, abbrBuf)
+                    for (id in abbrBuf) {
+                        val w = idx.words[id]
+                        extendBeam(beams, pos, end, w,
+                            kotlin.math.ln(idx.freqs[id] + 1.0) - logWTotal, beam)
+                    }
+                }
+                // c) 单字：仅完整音节，且带额外惩罚避免压过整词
+                if (syllables.contains(key)) {
+                    pyChars[key]?.let { chars ->
+                        val take = minOf(2, chars.size)
+                        for (i in 0 until take) {
+                            val c = chars[i]
+                            extendBeam(beams, pos, end, c.toString(),
+                                kotlin.math.ln((charFreq[c] ?: 1) + 1.0) - logCharTotal - CHAR_MIX, beam)
+                        }
+                    }
+                }
+            }
+        }
+        return beams[n].map { it.text }.filter { it.isNotEmpty() }
+    }
+
+    private class SegPath(val text: String, val score: Double)
+
+    private fun extendBeam(
+        beams: Array<ArrayList<SegPath>>, pos: Int, end: Int,
+        text: String, add: Double, beam: Int
+    ) {
+        val target = beams[end]
+        for (base in beams[pos]) {
+            target.add(SegPath(base.text + text, base.score + add))
+        }
+        if (target.size > beam) {
+            target.sortByDescending { it.score }
+            while (target.size > beam) target.removeAt(target.size - 1)
+        }
+    }
+
+    /** 在缩写分桶里找能匹配 [qStart,qEnd) 的词，按词频取前 want 个 */
+    private fun collectAbbr(
+        idx: WordIndex, q: String, qStart: Int, qEnd: Int, want: Int, out: ArrayList<Int>
+    ) {
+        val first = q[qStart]
+        if (first !in 'a'..'z') return
+        val li = first - 'a'
+        val qlen = qEnd - qStart
+        for (cnt in 2..minOf(MAX_SYL, qlen)) {
+            val arr = idx.abbrBuckets[li * (MAX_SYL + 1) + cnt] ?: continue
+            var found = 0
+            for (id in arr) {
+                if (matchAbbr(idx, id, q, qStart, qEnd)) {
+                    out.add(id)
+                    if (++found >= want) break
+                }
+            }
+        }
+        out.sortByDescending { idx.freqs[it] }
+    }
+
+    /** q 的 [qStart,qEnd) 是否能表示该词的缩写（每音节取全拼或首字母） */
+    private fun matchAbbr(idx: WordIndex, id: Int, q: String, qStart: Int, qEnd: Int): Boolean {
+        val lens = idx.wordSylLens[id] ?: return false
+        val joined = idx.wordSylJoined[id] ?: return false
+        val qlen = qEnd - qStart
+        if (qlen < lens.size || qlen > joined.length) return false
+        return matchAbbrRec(joined, lens, 0, 0, q, qStart, qEnd)
+    }
+
+    private fun matchAbbrRec(
+        joined: String, lens: IntArray, sylIdx: Int, jPos: Int,
+        q: String, qStart: Int, qEnd: Int
+    ): Boolean {
+        if (sylIdx == lens.size) return jPos == joined.length && qStart == qEnd
+        if (qStart >= qEnd) return false
+        val l = lens[sylIdx]
+        // 选项1：吃掉完整音节
+        if (qEnd - qStart >= l) {
+            var eq = true
+            for (k in 0 until l) {
+                if (q[qStart + k] != joined[jPos + k]) { eq = false; break }
+            }
+            if (eq && matchAbbrRec(joined, lens, sylIdx + 1, jPos + l, q, qStart + l, qEnd)) return true
+        }
+        // 选项2：只吃首字母
+        if (q[qStart] == joined[jPos] &&
+            matchAbbrRec(joined, lens, sylIdx + 1, jPos + l, q, qStart + 1, qEnd)
+        ) return true
+        return false
     }
 
     /** 单字候选：精确音节优先，其次前缀音节（按字频排序） */
@@ -418,48 +617,6 @@ object PinyinEngine {
             pos += matched.length
         }
         return res
-    }
-
-    private fun segmentTop(input: String, idx: WordIndex, k: Int): List<String> {
-        val memo = HashMap<Int, List<Pair<String, Long>>>()
-        fun dfs(pos: Int): List<Pair<String, Long>> {
-            memo[pos]?.let { return it }
-            if (pos == input.length) return listOf("" to 1L)
-            val res = ArrayList<Pair<String, Long>>()
-            val maxEnd = minOf(input.length, pos + 24)
-            for (end in maxEnd downTo pos + 1) {
-                val key = input.substring(pos, end)
-                for (v in fuzzyVariants(key)) {
-                    val arr = idx.byPy[v] ?: continue
-                    val take = minOf(3, arr.size)
-                    for (i in 0 until take) {
-                        val wi = arr[i]
-                        val w = idx.words[wi]
-                        val fr = idx.freqs[wi].toLong() + (userBoost[w] ?: 0)
-                        for ((tail, score) in dfs(end)) {
-                            if (tail.length + w.length > 32) continue
-                            res.add((w + tail) to (score * (fr + 1)))
-                        }
-                        if (res.size > 400) break
-                    }
-                    if (res.size > 400) break
-                }
-                if (res.size > 400) break
-            }
-            for (v in fuzzyVariants(input.substring(pos, minOf(input.length, pos + 7)))) {
-                val chars = pyChars[v] ?: continue
-                val c = chars.firstOrNull() ?: continue
-                val fr = (charFreq[c] ?: 0).toLong()
-                for ((tail, score) in dfs(pos + v.length)) {
-                    res.add((c + tail) to (score * (fr + 1)))
-                }
-                break
-            }
-            val top = res.sortedByDescending { it.second }.distinctBy { it.first }.take(k)
-            memo[pos] = top
-            return top
-        }
-        return dfs(0).map { it.first }
     }
 
     fun candidatesT9(digits: String, limit: Int = 30): List<String> {

@@ -5,12 +5,17 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -182,28 +187,88 @@ object UpdateChecker {
 
     // ---------------- 汇总检测 ----------------
 
+    /**
+     * 并发竞速检测：同时发起全部通道，谁先返回可用结果就用谁。
+     *
+     * 旧实现是串行逐个试，每通道 12s 超时且失败重试一次。国内网络下 api.github.com
+     * 与 github.com 经常直接不可达，仅前三个通道就要耗掉约 72 秒才轮到 jsdelivr，
+     * 这正是"检测更新特别慢"的主因（比安装包体积影响更大）。
+     * 改为并发后，可用通道通常 1~2 秒内返回；只有全部通道都失败才会等满超时。
+     */
     suspend fun check(ctx: Context): CheckResult = withContext(Dispatchers.IO) {
-        val errors = mutableListOf<String>()
-        val channels: List<Pair<String, () -> Remote?>> = listOf(
+        val channels: List<Pair<String, suspend () -> Remote?>> = listOf(
+            // jsdelivr CDN 放首位：国内可达性最好，且 version.json 带 sha256 与大小
+            "jsdelivr CDN" to { fromCdn() },
             "GitHub API" to { fromApi() },
             "GitHub 网页跳转" to { fromRedirect() },
-            "Atom 订阅源" to { fromAtom() },
-            "jsdelivr CDN" to { fromCdn() }
+            "Atom 订阅源" to { fromAtom() }
         )
-        for ((name, block) in channels) {
-            try {
-                val r = withRetry { block() }
-                if (r != null && r.tag.isNotBlank()) {
-                    // API 通道若无 apk 附件，用约定直链兜底
-                    val fixed = if (r.apkUrl.isNullOrBlank()) r.copy(apkUrl = guessApkUrl(r.tag)) else r
-                    return@withContext CheckResult(fixed, errors)
+
+        // 各通道跑在独立作用域里：落败通道多是阻塞式 HttpURLConnection，取消无法立刻中断，
+        // 若用 coroutineScope 等它们收尾就会重新退化成"等最慢的那个"。独立作用域让它们在
+        // 后台自行结束，本次检测在首个成功通道返回时立即结束。
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val winner = CompletableDeferred<Pair<Remote, String>>()
+        val errors = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val jobs = channels.map { (name, block) ->
+            scope.launch {
+                try {
+                    val r = withRetry { block() }
+                    if (r != null && r.tag.isNotBlank()) {
+                        winner.complete(r to name)
+                    } else {
+                        errors.add("$name：返回为空")
+                    }
+                } catch (e: Exception) {
+                    errors.add("$name：${e.message ?: e.javaClass.simpleName}")
                 }
-                errors.add("$name：返回为空")
-            } catch (e: Exception) {
-                errors.add("$name：${e.message ?: e.javaClass.simpleName}")
             }
         }
-        CheckResult(null, errors)
+        try {
+            val (r, name) = withTimeout(CHECK_TIMEOUT_MS) { winner.await() }
+            android.util.Log.i("MTUpdate", "check winner=$name tag=${r.tag}")
+            // 补齐下载直链与校验信息：非 CDN 通道缺 sha256/大小，尽力从 CDN 取一次。
+            // 这一步必须限时，否则会把"首个通道已成功"的速度优势又耗掉。
+            val meta = if (r.sha256 == null || r.apkSize <= 0) {
+                runCatching {
+                    withTimeout(META_TIMEOUT_MS) { withContext(Dispatchers.IO) { fetchCdnMeta(r.tag) } }
+                }.getOrNull()
+            } else null
+            val fixed = r.copy(
+                apkUrl = r.apkUrl?.takeIf { it.isNotBlank() } ?: guessApkUrl(r.tag),
+                sha256 = r.sha256 ?: meta?.first,
+                apkSize = if (r.apkSize > 0) r.apkSize else (meta?.second ?: 0L),
+                source = name
+            )
+            CheckResult(fixed, errors.toList())
+        } catch (e: Exception) {
+            errors.add("全部通道超时（${CHECK_TIMEOUT_MS / 1000}秒）")
+            CheckResult(null, errors.toList())
+        } finally {
+            jobs.forEach { it.cancel() }
+        }
+    }
+
+    private const val CHECK_TIMEOUT_MS = 20_000L
+    /** CDN 元数据补齐的限时：只为拿 sha256/大小，不能拖慢已经成功的检测 */
+    private const val META_TIMEOUT_MS = 3_000L
+
+    /** 带缓存的 CDN 元数据（sha256、大小），供非 CDN 通道补齐校验信息 */
+    @Volatile private var cdnMetaCache: Triple<String, String?, Long>? = null
+    private fun fetchCdnMeta(tag: String): Pair<String?, Long>? {
+        val cached = cdnMetaCache
+        if (cached != null && cached.first == tag) return cached.second to cached.third
+        return try {
+            val (code, body) = httpGet(CDN_VERSION)
+            if (code != 200) return null
+            val obj = JSONObject(body)
+            val v = obj.optString("version")
+            if (v.isBlank()) return null
+            val sha = obj.optString("sha256").takeIf { it.matches(Regex("[0-9a-fA-F]{64}")) }
+            val size = obj.optLong("apkSize", 0L)
+            cdnMetaCache = Triple(if (v.startsWith("v")) v else "v$v", sha, size)
+            sha to size
+        } catch (e: Exception) { null }
     }
 
     // ---------------- 下载（多通道回退 + 断点续传 + 校验 + 空间预检） ----------------
@@ -313,6 +378,21 @@ object UpdateChecker {
         val urls = try { probeChannels(url, remote.apkSize) } catch (e: Exception) { candidateUrls(url) }
         var lastErr: String? = null
         for ((i, u) in urls.withIndex()) {
+            // 先试分片并行下载（国内镜像多按单连接限速，多连接可成倍提速）；
+            // 通道不支持 Range 或分片失败时返回 null，自动回退单连接续传。
+            if (remote.apkSize > 0) {
+                try {
+                    val f = downloadSegmented(ctx, u, remote.sha256, remote.apkSize, onProgress)
+                    if (f != null) return@withContext f
+                    android.util.Log.i("MTUpdate", "segmented download unavailable on channel ${i + 1}, fallback")
+                } catch (e: Exception) {
+                    // 分片阶段校验失败（SHA256 不符等）说明通道内容不可信，直接换通道
+                    lastErr = "通道${i + 1}分片下载：${e.message ?: e.javaClass.simpleName}"
+                    android.util.Log.w("MTUpdate", "segmented failed on channel ${i + 1}", e)
+                    onProgress(0)
+                    continue
+                }
+            }
             var attempt = 0
             while (attempt < 2) {
                 attempt++
@@ -401,6 +481,16 @@ object UpdateChecker {
             }
         }
         conn.disconnect()
+        return finalizeDownload(part, out, sha256, expectSize, onProgress)
+    }
+
+    /**
+     * 下载收尾校验：大小、APK 魔数、SHA256 三重校验，全部通过才重命名为最终文件。
+     * 单连接与分片并行下载共用，保证两条路径的完整性判定完全一致。
+     */
+    private fun finalizeDownload(
+        part: File, out: File, sha256: String?, expectSize: Long, onProgress: (Int) -> Unit
+    ): File {
         // 校验 1：大小合理（下限 3MB 防半截文件；有期望大小时精确比对）
         if (part.length() < 3L * 1024 * 1024) {
             part.delete()
@@ -430,6 +520,117 @@ object UpdateChecker {
         if (!part.renameTo(out)) throw UpdateException("无法保存安装包")
         onProgress(100)
         return out
+    }
+
+    /** 分片并行下载的连接数（国内镜像多为单连接限速，多连接可成倍提速） */
+    private const val SEGMENTS = 6
+
+    /**
+     * 分片并行下载：把安装包按字节切成 [SEGMENTS] 段，多连接同时下载。
+     *
+     * 为什么需要：单连接从 gh-proxy 等国内镜像下 86MB 常被限速到几十 KB/s，
+     * 而镜像多按「单连接」限速，开多连接能成倍提速，直接解决"更新太慢"。
+     *
+     * 前置条件：已知期望大小、且通道支持 Range（探测阶段已验证）。
+     * 任一分片失败（如通道不支持 206）即清理分片并返回 null，
+     * 由调用方回退到单连接续传 [downloadOnce]，最坏情况等同旧行为。
+     */
+    private suspend fun downloadSegmented(
+        ctx: Context, url: String, sha256: String?, expectSize: Long,
+        onProgress: (Int) -> Unit
+    ): File? = withContext(Dispatchers.IO) {
+        // 太小没必要分片；大小未知无法分片
+        if (expectSize < SEGMENTS * 256 * 1024L) return@withContext null
+        val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "updates").apply { mkdirs() }
+        val out = File(dir, "update.apk")
+        val part = File(dir, "update.apk.part")
+        val segFiles = (0 until SEGMENTS).map { File(dir, "seg_$it.part") }
+        val segSize = (expectSize + SEGMENTS - 1) / SEGMENTS
+        val ranges = (0 until SEGMENTS).map { i ->
+            val s = i * segSize
+            val e = minOf(expectSize - 1, s + segSize - 1)
+            i to (s to e)
+        }.filter { it.second.first <= it.second.second }
+
+        val done = java.util.concurrent.atomic.AtomicLong(
+            segFiles.sumOf { if (it.exists()) it.length() else 0L }
+        )
+        val failed = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            coroutineScope {
+                ranges.map { (idx, range) ->
+                    val (s, e) = range
+                    async {
+                        val segFile = segFiles[idx]
+                        val wantLen = e - s + 1
+                        if (segFile.exists() && segFile.length() == wantLen) return@async
+                        val ok = downloadSegment(url, segFile, s, e, wantLen) { add ->
+                            val cur = done.addAndGet(add)
+                            onProgress(((cur * 100) / expectSize).toInt().coerceIn(0, 99))
+                        }
+                        if (!ok) failed.set(true)
+                    }
+                }.awaitAll()
+            }
+            if (failed.get()) { segFiles.forEach { it.delete() }; return@withContext null }
+            // 合并分片为完整 part 文件
+            if (part.exists()) part.delete()
+            RandomAccessFile(part, "rw").use { raf ->
+                for ((idx, _) in ranges) {
+                    segFiles[idx].inputStream().use { ins ->
+                        val buf = ByteArray(64 * 1024)
+                        var n: Int
+                        while (ins.read(buf).also { n = it } != -1) raf.write(buf, 0, n)
+                    }
+                }
+            }
+            segFiles.forEach { it.delete() }
+            if (part.length() != expectSize) { part.delete(); return@withContext null }
+            finalizeDownload(part, out, sha256, expectSize, onProgress)
+        } catch (e: Exception) {
+            segFiles.forEach { it.delete() }
+            if (part.exists()) part.delete()
+            throw e
+        }
+    }
+
+    /** 下载单个分片到独立文件，支持分片级续传；通道不支持 Range（非 206）则返回 false */
+    private fun downloadSegment(
+        url: String, segFile: File, start: Long, end: Long, wantLen: Long,
+        onBytes: (Long) -> Unit
+    ): Boolean {
+        var resume = if (segFile.exists()) segFile.length() else 0L
+        if (resume >= wantLen) return true
+        return try {
+            var conn = open(url, timeoutMs = 15000)
+            conn.readTimeout = 12000
+            conn.setRequestProperty("Range", "bytes=${start + resume}-${end}")
+            var code = conn.responseCode
+            if (code == 416) { // 续传越界，整片重来
+                segFile.delete(); resume = 0
+                conn.disconnect()
+                conn = open(url, timeoutMs = 15000); conn.readTimeout = 12000
+                conn.setRequestProperty("Range", "bytes=${start}-${end}")
+                code = conn.responseCode
+            }
+            // 分片下载必须服务端支持 Range；返回 200 说明不支持，放弃分片让上层回退
+            if (code != 206) { conn.disconnect(); return false }
+            conn.inputStream.use { input ->
+                RandomAccessFile(segFile, "rw").use { raf ->
+                    raf.seek(resume)
+                    val buf = ByteArray(64 * 1024)
+                    var n: Int
+                    while (input.read(buf).also { n = it } != -1) {
+                        raf.write(buf, 0, n)
+                        onBytes(n.toLong())
+                    }
+                }
+            }
+            conn.disconnect()
+            segFile.length() == wantLen
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun sha256Of(f: File): String {

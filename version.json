@@ -1,8 +1,8 @@
 {
-    "version":  "v1.1.0",
-    "versionCode":  11,
-    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.1.0/mengting-ime-v1.1.0.apk",
-    "sha256":  "a72714b0d68a0b571dc623f4f6032fc997d9b1d2bd04408de8beb726117ddbed",
-    "notes":  "9项优化：输入过的候选词按频次自动前移；翻译框一分为二(中↔英自动互译+各自语言字符过滤)；修复回车键误触返回并按场景显示回车/搜索/发送/完成+多行换行；修复符号面板翻页跳级(手势闭包刷新)；版本号进位逻辑修正(1.0.9→1.1.0)；手写模式非GMS设备崩溃保护；新增字典按钮(手写板离线查读音与例词)；新增语音按钮(长文语音转写开关)；模拟器窗口缩放适配。",
-    "apkSize":  86011782
+    "version":  "v1.1.1",
+    "versionCode":  12,
+    "apkUrl":  "https://github.com/sml1145/jianpan/releases/download/v1.1.1/mengting-ime-v1.1.1.apk",
+    "sha256":  "cfc2fd12515b6d954d661314074921564541cfbb19b19a760927c21dc30c355f",
+    "notes":  "7项优化：1.混合简拼候选(输入nhao现可出「你好」，修复简拼+全拼混合无候选)；2.手写识别改为本地ONNX离线推理(达摩院中英文手写模型，彻底摆脱Google Play服务，无GMS设备也能用，模型首次使用时从ModelScope国内直连拉取)；3.语音识别准确率提升(采集与解码双线程分离避免丢音+VOICE_RECOGNITION音源+端点静音阈值放宽至1.8/3.0s+30s兜底)；4.新增整句/诗句候选(cmbjx→春眠不觉晓、jttqzmy→今天天气怎么样)；5.词库强化到31万词(并入清华THUOCL诗词/成语/IT等语料)；6.应用内更新提速(检测改多通道并发竞速+下载改6分片并行+断点续传)；7.单音节输入优先出单字(输入pai先出牌/拍/排而非排队/拍摄)。同时移除了MLKit依赖，安装包从82MB降到62MB。",
+    "apkSize":  64877862
 }
