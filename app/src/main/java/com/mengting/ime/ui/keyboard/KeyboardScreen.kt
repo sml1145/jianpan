@@ -1152,8 +1152,31 @@ private fun flushComposition(host: KeyboardHost) {
     }
 }
 
-private fun onChar(host: KeyboardHost, c: String) {
+/**
+ * 字母键输入入口。
+ *
+ * 声明为 public 是因为 androidTest 是独立编译模块，Kotlin 的 internal（模块级可见性）
+ * 无法被测试 APK 访问，会抛 IllegalAccessError；本模块是 app 而非 library，公开它无 API 契约负担。
+ */
+fun onChar(host: KeyboardHost, c: String) {
     val state = host.state
+    // 大写开启时字母直接上屏，不进拼音组合区。
+    // 否则中文键盘下点大写再点字母会被强制要求选候选词，无法直接输入大写字母。
+    if (state.capsMode > 0 && c.length == 1 && c[0].isLetter()) {
+        // 先算好大写字符：commitText() 内部会把「单次大写」复位为 0，
+        // 若放在 flushComposition 之后再取值，单次大写会被 flush 的提交提前吃掉。
+        val upper = c.uppercase()
+        // 有未提交的拼音组合时先按首选词上屏，避免大写字母与拼音串混杂
+        flushComposition(host)
+        if (state.translateActive) {
+            // 翻译框不经 commitText()，单次大写需在此复位，否则会退化成锁死大写
+            state.appendTrans(upper)
+            if (state.capsMode == 1) state.capsMode = 0
+        } else {
+            host.commitText(upper)
+        }
+        return
+    }
     // 字母进组合区以产生候选；翻译框聚焦时不把拼音推入主编辑器（避免泄漏到应用输入框）
     state.composing += c.lowercase()
     if (!state.translateActive) host.setComposing(state.composing)
