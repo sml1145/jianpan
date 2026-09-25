@@ -7,6 +7,8 @@ import android.widget.Toast
 import com.mengting.ime.core.AppPrefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -18,8 +20,16 @@ import java.net.URLEncoder
  * 全局翻译：
  *  - translateCurrent：长按中英切换键，翻译当前输入框整段文本
  *  - translateText：翻译面板逐词翻译（中→英 / 英→中自动判断），返回多条候选
+ *
+ * 协程治理：所有请求跑在同一个受管作用域（SupervisorJob + IO），不再每次调用
+ * 新建无人回收的 `CoroutineScope(...)`。面板逐词翻译还会在发起新请求前取消上一次，
+ * 避免用户快速输入时旧的慢响应回来覆盖新结果（乱序回填）。
  */
 object TranslateHelper {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** 面板翻译的上一个任务，发起新翻译前取消它 */
+    private var panelJob: Job? = null
 
     fun translateCurrent(ctx: Context, done: (String?) -> Unit) {
         val ic = (ctx as? android.inputmethodservice.InputMethodService)?.currentInputConnection
@@ -30,7 +40,7 @@ object TranslateHelper {
             done(null)
             return
         }
-        CoroutineScope(Dispatchers.IO).launch {
+        scope.launch {
             val result = try { translate(text.trim()) } catch (e: Exception) { null }
             withContext(Dispatchers.Main) {
                 if (result == null) toast(ctx, "翻译失败，请检查网络")
@@ -39,13 +49,15 @@ object TranslateHelper {
         }
     }
 
-    /** 面板翻译：返回结果列表（主翻译 + 备选） */
+    /** 面板翻译：返回结果列表（主翻译 + 备选）。发起前取消上一次，防乱序覆盖。 */
     fun translateText(text: String, onResult: (List<String>) -> Unit) {
         if (text.isBlank()) {
+            panelJob?.cancel()
             onResult(emptyList())
             return
         }
-        CoroutineScope(Dispatchers.IO).launch {
+        panelJob?.cancel()
+        panelJob = scope.launch {
             val list = mutableListOf<String>()
             try {
                 translate(text.trim())?.let { list.add(it) }

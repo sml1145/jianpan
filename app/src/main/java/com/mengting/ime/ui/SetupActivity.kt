@@ -4,6 +4,7 @@ import android.Manifest
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -41,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.core.content.ContextCompat
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,6 +58,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mengting.ime.BuildConfig
 import com.mengting.ime.core.AppPrefs
+import com.mengting.ime.core.MediaImporter
+import java.io.File
 import com.mengting.ime.feature.update.UpdateChecker
 import com.mengting.ime.widget.TypingStatsWidget
 import com.mengting.ime.widget.WidgetPinCallback
@@ -64,13 +68,46 @@ import kotlinx.coroutines.launch
 /** 首次引导 + 设置中心（主页 + 两个副页，系统返回键先回主页） */
 class SetupActivity : ComponentActivity() {
 
+    /**
+     * 背景图选择：复制进私有目录后记录路径。
+     *
+     * 不能直接存 Uri —— GetContent 用的是 ACTION_GET_CONTENT，只授予临时读权限，
+     * 且不支持 takePersistableUriPermission（原实现调用它并把 SecurityException 静默吞掉，
+     * 于是弹出「已应用」却对输入法服务不可读，背景永远不生效）。
+     * 复制成私有文件后读取不再依赖任何授权。失败时把原因如实告知，不再谎报成功。
+     */
     private val bgPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (_: Exception) {}
-            AppPrefs.customBackgroundUri = uri.toString()
-            Toast.makeText(this, "自定义背景已应用", Toast.LENGTH_SHORT).show()
+        if (uri == null) return@registerForActivityResult
+        when (val r = MediaImporter.importBackground(this, uri)) {
+            is MediaImporter.Result.Ok -> {
+                AppPrefs.setCustomBackground(r.path)
+                bgStatus = "已应用自定义背景（背景动画已自动关闭）"
+                refreshKey++
+                Toast.makeText(this, "自定义背景已应用", Toast.LENGTH_SHORT).show()
+            }
+            is MediaImporter.Result.Fail -> {
+                bgStatus = "未生效：${r.reason}"
+                Toast.makeText(this, "背景未生效：${r.reason}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** 自定义音效选择：同样复制进私有目录，并立即试听给出可感知反馈。 */
+    private val soundPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult
+        when (val r = MediaImporter.importSound(this, uri)) {
+            is MediaImporter.Result.Ok -> {
+                AppPrefs.setCustomSound(r.path)
+                soundStatus = "已应用自定义音效：${File(r.path).name}"
+                refreshKey++
+                // 立即试听：让用户当场听到效果，而不是等到打字时才发现没声音
+                SoundPreview.playFile(this, r.path)
+                Toast.makeText(this, "自定义音效已应用，正在试听", Toast.LENGTH_SHORT).show()
+            }
+            is MediaImporter.Result.Fail -> {
+                soundStatus = "未生效：${r.reason}"
+                Toast.makeText(this, "音效未生效：${r.reason}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -86,14 +123,24 @@ class SetupActivity : ComponentActivity() {
 
     private var refreshKey by mutableStateOf(0)
 
+    // 背景/音效导入的即时状态文案（类级别：picker 回调在此，需能刷新 UI）。
+    // 为空表示无提示；失败时如实展示原因，绝不再无脑弹「已应用」。
+    private var bgStatus by mutableStateOf("")
+    private var soundStatus by mutableStateOf("")
+
     // 副页导航：0=主页 1=前置准备 2=键盘设置
     private var subPage by mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33) notifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
-        audioPerm.launch(Manifest.permission.RECORD_AUDIO)
-        smsPerm.launch(Manifest.permission.RECEIVE_SMS)
+        // 按需请求：已授权就不再弹，避免每次进设置页重复骚扰用户（旧实现无条件 launch 三个权限）。
+        // 这些权限分别服务于语音输入、短信验证码捕获、更新通知，缺失时对应功能会自行降级提示，
+        // 因此首次未授权也允许稍后在对应功能处再补授，不在启动时强制三连弹。
+        requestIfMissing(Manifest.permission.RECORD_AUDIO) { audioPerm.launch(it) }
+        requestIfMissing(Manifest.permission.RECEIVE_SMS) { smsPerm.launch(it) }
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestIfMissing(Manifest.permission.POST_NOTIFICATIONS) { notifyPerm.launch(it) }
+        }
         // 系统返回键：副页先回主页，主页才退出应用
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -105,12 +152,23 @@ class SetupActivity : ComponentActivity() {
                 }
             }
         })
-        setContent { SetupScreen(bgPicker = { bgPicker.launch("image/*") }) }
+        setContent {
+            SetupScreen(
+                bgPicker = { bgPicker.launch("image/*") },
+                soundPicker = { soundPicker.launch("audio/*") }
+            )
+        }
     }
 
     override fun onResume() {
         super.onResume()
         refreshKey++
+    }
+
+    /** 仅在权限尚未授予时发起请求，避免每次进入设置页重复弹窗。 */
+    private fun requestIfMissing(permission: String, launch: (String) -> Unit) {
+        val granted = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        if (!granted) launch(permission)
     }
 
     private fun isImeEnabled(): Boolean {
@@ -177,7 +235,7 @@ class SetupActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SetupScreen(bgPicker: () -> Unit) {
+    private fun SetupScreen(bgPicker: () -> Unit, soundPicker: () -> Unit) {
         val ctx = LocalContext.current
         var enabled by remember { mutableStateOf(isImeEnabled()) }
         var isDefault by remember { mutableStateOf(isImeDefault()) }
@@ -187,9 +245,12 @@ class SetupActivity : ComponentActivity() {
         }
         var sound by remember { mutableStateOf(AppPrefs.soundOn) }
         var vib by remember { mutableStateOf(AppPrefs.vibrateOn) }
-        var pack by remember { mutableIntStateOf(AppPrefs.soundPack) }
+        // 外观类设置改为订阅 StateFlow：picker 回调改值后此处自动刷新，无需手动 refreshKey
+        val pack by AppPrefs.soundPack.collectAsState()
+        val customSound by AppPrefs.customSoundPath.collectAsState()
         var net by remember { mutableStateOf(AppPrefs.netBoost) }
-        var anim by remember { mutableStateOf(AppPrefs.bgAnimationOn) }
+        val anim by AppPrefs.bgAnimationOn.collectAsState()
+        val customBg by AppPrefs.customBackgroundPath.collectAsState()
         var invert by remember { mutableStateOf(AppPrefs.singleHandInvert) }
         var side by remember { mutableIntStateOf(AppPrefs.singleHandSide) }
         var keyColor by remember { mutableIntStateOf(AppPrefs.keyColor) }
@@ -300,14 +361,29 @@ class SetupActivity : ComponentActivity() {
                     2 -> {
                         // ===== 副页：键盘设置（外观+输入体验） =====
                         Section("键盘外观")
-                        SwitchRow("背景动画（像素动效）", anim) { anim = it; AppPrefs.bgAnimationOn = it }
+                        // 背景动画与自定义背景互斥：开动画会清除自定义背景，反之亦然
+                        SwitchRow("背景动画（像素动效）", anim) { AppPrefs.setBgAnimation(it) }
                         Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text("自定义背景", fontSize = 14.sp)
                             Spacer(Modifier.weight(1f))
                             Button(onClick = bgPicker) { Text("上传图片") }
                             Button(colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD9B8C9)),
-                                onClick = { AppPrefs.customBackgroundUri = ""; Toast.makeText(ctx, "已恢复时间动态背景", Toast.LENGTH_SHORT).show() }) { Text("恢复默认") }
+                                onClick = {
+                                    AppPrefs.setCustomBackground("")
+                                    bgStatus = "已恢复默认像素背景（背景动画已重新开启）"
+                                    Toast.makeText(ctx, "已恢复默认背景", Toast.LENGTH_SHORT).show()
+                                }) { Text("恢复默认") }
                         }
+                        // 当前背景状态如实展示：是否已设自定义背景、导入是否失败及原因
+                        Text(
+                            when {
+                                bgStatus.isNotEmpty() -> bgStatus
+                                customBg.isNotEmpty() -> "当前：已使用自定义背景（动画已关闭）"
+                                else -> "当前：默认像素背景（随时间变化）"
+                            },
+                            fontSize = 11.sp,
+                            color = if (bgStatus.startsWith("未生效")) Color(0xFFC0392B) else Color(0xFF8A6B7A)
+                        )
                         Text("按键颜色", fontSize = 14.sp)
                         val colors = listOf(
                             0 to "默认", 0xFFE86AC0.toInt() to "粉", 0xFFFF8A9E.toInt() to "桃",
@@ -350,10 +426,11 @@ class SetupActivity : ComponentActivity() {
                             for ((v, label) in listOf(0 to "清脆", 1 to "机械", 2 to "泡泡")) {
                                 Button(
                                     colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (pack == v) Color(0xFFB23A8F) else Color(0xFFE5C9D8)),
+                                        // 自定义音效生效时不选中任何内置包
+                                        containerColor = if (pack == v && customSound.isEmpty()) Color(0xFFB23A8F) else Color(0xFFE5C9D8)),
                                     onClick = {
-                                        pack = v
-                                        AppPrefs.soundPack = v
+                                        AppPrefs.setSoundPack(v)
+                                        soundStatus = ""
                                         if (!AppPrefs.soundOn) {
                                             AppPrefs.soundOn = true
                                             sound = true
@@ -363,6 +440,30 @@ class SetupActivity : ComponentActivity() {
                                 ) { Text(label, fontSize = 12.sp) }
                             }
                         }
+                        // 自定义音效：上传后仅替换点按音，空格/删除仍用内置
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("自定义点按音效", fontSize = 14.sp)
+                            Spacer(Modifier.weight(1f))
+                            Button(onClick = soundPicker) { Text("上传音效") }
+                            if (customSound.isNotEmpty()) {
+                                Button(colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD9B8C9)),
+                                    onClick = {
+                                        MediaImporter.clearCustomSound(ctx)
+                                        AppPrefs.setCustomSound("")
+                                        soundStatus = "已恢复内置音效包"
+                                        SoundPreview.release()
+                                    }) { Text("恢复内置") }
+                            }
+                        }
+                        Text(
+                            when {
+                                soundStatus.isNotEmpty() -> soundStatus
+                                customSound.isNotEmpty() -> "当前：自定义音效 ${File(customSound).name}"
+                                else -> "当前：内置音效包（支持 wav/mp3/ogg/m4a/aac/flac，建议 1 秒内短音）"
+                            },
+                            fontSize = 11.sp,
+                            color = if (soundStatus.startsWith("未生效")) Color(0xFFC0392B) else Color(0xFF8A6B7A)
+                        )
                         SwitchRow("按键振动", vib) { vib = it; AppPrefs.vibrateOn = it }
                         SwitchRow("联网增强词库（提升词汇准确率，默认开）", net) { net = it; AppPrefs.netBoost = it }
 

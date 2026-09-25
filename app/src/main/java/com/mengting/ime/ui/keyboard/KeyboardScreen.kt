@@ -59,6 +59,7 @@ import com.mengting.ime.feature.sms.SmsCodeHolder
 import com.mengting.ime.ui.background.PixelArtBackground
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 // ---------- 布局数据 ----------
@@ -236,20 +237,33 @@ private fun LayoutPicker(current: Int, onPick: (Int) -> Unit, onDismiss: () -> U
 
 @Composable
 private fun BackgroundLayer(modifier: Modifier = Modifier) {
-    val uri = AppPrefs.customBackgroundUri
-    if (uri.isNotEmpty()) {
-        val context = LocalContext.current
-        val bitmap = remember(uri) {
+    // 订阅可观察状态：用户在设置页换背景后键盘立即重组，无需重启输入法进程
+    val bgPath by AppPrefs.customBackgroundPath.collectAsState()
+    val animOn by AppPrefs.bgAnimationOn.collectAsState()
+
+    // 异步解码：图片解码是重活，放在组合里同步做会阻塞主线程，
+    // 大图（即使已降采样到 1080）仍可能卡顿甚至 ANR。
+    var bitmap by remember(bgPath) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(bgPath) {
+        bitmap = if (bgPath.isEmpty()) null
+        else withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                context.contentResolver.openInputStream(android.net.Uri.parse(uri))
-                    ?.use { android.graphics.BitmapFactory.decodeStream(it) }
-            } catch (e: Exception) { null }
+                val f = java.io.File(bgPath)
+                if (!f.exists() || f.length() <= 0) null
+                else android.graphics.BitmapFactory.decodeFile(f.absolutePath)
+            } catch (e: OutOfMemoryError) {
+                null
+            } catch (e: Exception) {
+                null
+            }
         }
-        if (bitmap != null) {
-            Image(bitmap.asImageBitmap(), null, modifier, contentScale = ContentScale.Crop)
-        } else PixelArtBackground(modifier = modifier, animOn = AppPrefs.bgAnimationOn)
+    }
+
+    val bmp = bitmap
+    if (bgPath.isNotEmpty() && bmp != null) {
+        Image(bmp.asImageBitmap(), null, modifier, contentScale = ContentScale.Crop)
     } else {
-        PixelArtBackground(modifier = modifier, animOn = AppPrefs.bgAnimationOn)
+        PixelArtBackground(modifier = modifier, animOn = animOn)
     }
 }
 

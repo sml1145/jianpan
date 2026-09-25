@@ -11,8 +11,8 @@ android {
         applicationId = "com.mengting.ime"
         minSdk = 24
         targetSdk = 34
-        versionCode = 14
-        versionName = "1.1.3"
+        versionCode = 15
+        versionName = "1.1.4"
         // Real devices only need arm dual architectures; emulator self-check uses debug builds with x86_64
         ndk.abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
